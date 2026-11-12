@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="uk">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#101411" />
+    <meta
+      name="description"
+      content="Локальний вебмонітор для JK BMS через Bluetooth LE."
+    />
+    <title>JK BMS — монітор батареї</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script type="module" src="./app.mjs"></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <a class="brand" href="./" aria-label="JK BMS Monitor, головна">
+          <span class="brand-mark" aria-hidden="true">JK</span>
+          <span>BATTERY MONITOR</span>
+        </a>
+        <div class="topbar-right">
+          <span id="connection-indicator" class="connection-indicator">
+            <span class="status-dot"></span>
+            <span id="connection-state">Не підключено</span>
+          </span>
+          <button id="connect-button" class="button button-primary" type="button">
+            Підключити BMS
+          </button>
+          <button id="disconnect-button" class="button button-quiet" type="button" disabled>
+            Від’єднати
+          </button>
+          <button
+            id="layout-toggle"
+            class="button button-outline"
+            type="button"
+            aria-pressed="false"
+            aria-label="Увімкнути компонування блоків"
+          >
+            Розташування
+          </button>
+          <button id="layout-reset" class="button button-quiet" type="button" hidden>
+            Скинути
+          </button>
+        </div>
+      </header>
+
+      <section class="intro">
+        <div>
+          <p class="eyebrow">ЛОКАЛЬНИЙ BLE-МОНІТОРИНГ</p>
+          <h1>Стан батареї<span class="accent">.</span></h1>
+          <p id="device-summary" class="subheading">
+            Підключи JK BMS, щоб переглядати дані в реальному часі.
+          </p>
+        </div>
+        <button id="refresh-button" class="button button-outline" type="button" disabled>
+          Оновити дані
+          <span aria-hidden="true">↻</span>
+        </button>
+      </section>
+
+      <div id="notice" class="notice" role="status" hidden></div>
+      <p id="layout-hint" class="layout-hint" role="status" hidden>
+        Перетягни блок за ⠿, зміни розмір за кутовий маркер або скористайся стрілками клавіатури.
+      </p>
+
+      <section id="dashboard-grid" class="dashboard-grid" aria-label="Блоки моніторингу батареї">
+        <article class="metric-card metric-primary dashboard-widget widget-metric" data-widget="soc">
+          <div class="metric-heading">
+            <span>ЗАРЯД БАТЕРЕЇ</span>
+            <span class="metric-symbol" aria-hidden="true">%</span>
+          </div>
+          <div class="metric-value"><span id="soc-value">—</span><small>%</small></div>
+          <div class="metric-foot"><span id="capacity-value">—</span> Ah залишилось</div>
+          <div class="soc-track"><span id="soc-bar"></span></div>
+        </article>
+        <article class="metric-card dashboard-widget widget-metric" data-widget="voltage">
+          <div class="metric-heading">
+            <span>НАПРУГА</span>
+            <span class="metric-symbol" aria-hidden="true">↗</span>
+          </div>
+          <div class="metric-value"><span id="voltage-value">—</span><small>V</small></div>
+          <div class="metric-foot">Середня комірка <span id="average-cell-value">—</span> V</div>
+        </article>
+        <article class="metric-card dashboard-widget widget-metric" data-widget="current">
+          <div class="metric-heading">
+            <span>СТРУМ</span>
+            <span class="metric-symbol" aria-hidden="true">⌁</span>
+          </div>
+          <div class="metric-value"><span id="current-value">—</span><small>A</small></div>
+          <div class="metric-foot">Балансування <span id="balance-value">—</span> A</div>
+        </article>
+        <article class="metric-card dashboard-widget widget-metric" data-widget="power">
+          <div class="metric-heading">
+            <span>ПОТУЖНІСТЬ</span>
+            <span class="metric-symbol" aria-hidden="true">⚡</span>
+          </div>
+          <div class="metric-value"><span id="power-value">—</span><small>W</small></div>
+          <div class="metric-foot">Температура MOS <span id="mos-temperature-value">—</span> °C</div>
+        </article>
+        <article class="panel cells-panel dashboard-widget widget-cells" data-widget="cells">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">РОЗПОДІЛ НАПРУГИ</p>
+              <h2>Напруга комірок у часі <span id="cell-count-label" class="count-label">—</span></h2>
+            </div>
+            <div class="spread-pill">
+              <span class="status-dot"></span>
+              Розкид <strong id="spread-value">—</strong> mV
+            </div>
+          </div>
+          <div class="chart-wrap">
+            <svg
+              id="voltage-chart"
+              class="voltage-chart"
+              viewBox="0 0 800 250"
+              role="img"
+              aria-label="Графік напруги комірок"
+            >
+              <text class="chart-empty" x="400" y="126" text-anchor="middle">
+                Графік з’явиться після отримання вимірювань
+              </text>
+            </svg>
+          </div>
+          <div id="chart-legend" class="chart-legend" aria-label="Легенда комірок"></div>
+          <div id="cells-grid" class="cells-grid" aria-live="polite">
+            <p class="empty-state">Дані комірок з’являться після підключення.</p>
+          </div>
+          <div class="panel-foot">
+            <span><i class="legend-dot legend-normal"></i> Напруга комірки</span>
+            <span id="last-update">Очікування даних</span>
+          </div>
+        </article>
+        <article class="panel dashboard-widget widget-status" data-widget="status">
+          <div class="panel-heading panel-heading-compact">
+            <div>
+              <p class="eyebrow">ПРО ПРИСТРІЙ</p>
+              <h2>Статус BMS</h2>
+            </div>
+            <span class="device-icon" aria-hidden="true">▦</span>
+          </div>
+          <dl class="detail-list">
+            <div><dt>Модель</dt><dd id="model-value">Не визначена</dd></div>
+            <div><dt>Комірки</dt><dd id="settings-cell-count">—</dd></div>
+            <div><dt>Заряджання</dt><dd id="charging-value">—</dd></div>
+            <div><dt>Розряджання</dt><dd id="discharging-value">—</dd></div>
+            <div><dt>Балансування</dt><dd id="balancing-value">—</dd></div>
+            <div><dt>Температура датчика 1</dt><dd id="temperature-1-value">—</dd></div>
+            <div><dt>Температура датчика 2</dt><dd id="temperature-2-value">—</dd></div>
+            <div><dt>Цикли</dt><dd id="cycles-value">—</dd></div>
+          </dl>
+        </article>
+
+        <article class="panel dashboard-widget widget-alarms" data-widget="alarms">
+          <div class="panel-heading panel-heading-compact">
+            <div>
+              <p class="eyebrow">ЗАХИСТ</p>
+              <h2>Тривоги та захист</h2>
+            </div>
+          </div>
+          <p id="protection-status" class="protection-status" data-state="unknown" role="status" aria-live="polite">
+            Очікування телеметрії BMS
+          </p>
+          <ul id="protection-list" class="protection-list" aria-label="Активні тривоги" hidden></ul>
+        </article>
+
+        <article class="panel settings-panel dashboard-widget widget-settings" data-widget="settings">
+          <div class="panel-heading panel-heading-compact">
+            <div>
+              <p class="eyebrow">КОНФІГУРАЦІЯ</p>
+              <h2>Налаштування</h2>
+            </div>
+            <span class="read-only-tag">ТІЛЬКИ ЧИТАННЯ</span>
+          </div>
+          <p class="settings-copy">
+            Зчитуються базові прапорці з BMS. Запис вимкнено, доки не підтверджено модель і сумісність протоколу.
+          </p>
+          <button id="settings-button" class="button button-outline button-wide" type="button" disabled>
+            Налаштування доступні після з’єднання
+          </button>
+        </article>
+
+        <section class="panel logs-panel dashboard-widget widget-logs" data-widget="logs">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">ЛОКАЛЬНИЙ ЖУРНАЛ</p>
+              <h2>Вимірювання <span id="log-count" class="count-label">0</span></h2>
+            </div>
+            <div class="log-actions">
+              <button id="export-button" class="button button-outline" type="button" disabled>
+                Експортувати CSV
+              </button>
+              <button id="clear-logs-button" class="button button-quiet" type="button" disabled>
+                Очистити
+              </button>
+            </div>
+          </div>
+          <div class="log-summary">
+            <span>Зразки зберігаються лише в цьому браузері.</span>
+            <span id="last-log">Дані ще не записувалися</span>
+          </div>
+        </section>
+      </section>
+
+      <footer class="footer">
+        <span>JK BMS Monitor <span class="footer-divider">/</span> Працює локально у браузері</span>
+        <span>Для JK02 BLE • Запис налаштувань вимкнено</span>
+      </footer>
+    </main>
+  </body>
+</html>

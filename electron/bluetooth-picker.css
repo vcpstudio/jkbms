@@ -1,0 +1,94 @@
+:root {
+  color-scheme: dark;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #111512;
+  color: #e7eee7;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}
+
+.picker {
+  padding: 28px;
+}
+
+.eyebrow {
+  margin: 0 0 10px;
+  color: #9ab879;
+  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.14em;
+}
+
+h1 {
+  margin: 0 0 12px;
+  font-size: 22px;
+  font-weight: 600;
+}
+
+.device-status {
+  color: #aab8ad;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.device-list {
+  display: grid;
+  gap: 8px;
+  max-height: 320px;
+  margin: 18px 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+}
+
+.device-button,
+.cancel-button {
+  width: 100%;
+  min-height: 44px;
+  border: 1px solid #39443a;
+  border-radius: 8px;
+  background: #1a211c;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.device-button {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  padding: 9px 12px;
+}
+
+.device-button:hover,
+.device-button:focus-visible {
+  border-color: #b7f36a;
+  outline: none;
+}
+
+.device-name {
+  font-size: 13px;
+}
+
+.device-id {
+  color: #7f8d81;
+  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.cancel-button {
+  padding: 0 12px;
+  text-align: center;
+}
+
+.cancel-button:hover,
+.cancel-button:focus-visible {
+  border-color: #687a69;
+  outline: none;
+}

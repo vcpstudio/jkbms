@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="uk">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Вибір Bluetooth-пристрою</title>
+    <link rel="stylesheet" href="./bluetooth-picker.css" />
+    <script src="./bluetooth-picker.js" defer></script>
+  </head>
+  <body>
+    <main class="picker">
+      <p class="eyebrow">BLUETOOTH LE</p>
+      <h1>Вибери JK BMS</h1>
+      <p id="device-status" class="device-status" role="status" aria-live="polite">
+        Пошук пристроїв…
+      </p>
+      <ul id="device-list" class="device-list" aria-label="Знайдені Bluetooth-пристрої"></ul>
+      <button id="cancel-button" class="cancel-button" type="button">Скасувати</button>
+    </main>
+  </body>
+</html>
