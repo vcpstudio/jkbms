@@ -10,10 +10,10 @@
   "scripts": {
     "start": "electron .",
     "test": "node --test protocol.test.mjs flow-periods.test.mjs voltage-chart-data.test.mjs discharge-forecast.test.mjs",
-    "dist": "electron-builder",
-    "dist:mac": "electron-builder --mac dmg",
-    "dist:win": "electron-builder --win nsis",
-    "dist:linux": "electron-builder --linux AppImage"
+    "dist": "electron-builder --publish never",
+    "dist:mac": "electron-builder --mac dmg --publish never",
+    "dist:win": "electron-builder --win nsis --publish never",
+    "dist:linux": "electron-builder --linux AppImage --publish never"
   },
   "devDependencies": {
     "electron": "45.3.1",
