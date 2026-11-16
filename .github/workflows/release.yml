@@ -58,6 +58,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
             --title "JK BMS Monitor $GITHUB_REF_NAME" \
             --notes "Перший реліз JK BMS Monitor.
 
