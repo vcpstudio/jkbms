@@ -1,10 +1,12 @@
-const { app, BrowserWindow, dialog, ipcMain, protocol, session } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, protocol, session, shell } = require("electron");
+const { autoUpdater } = require("electron-updater");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 
 const APP_SCHEME = "jkbms";
 const APP_HOST = "app";
 const APP_ORIGIN = `${APP_SCHEME}://${APP_HOST}`;
+const RELEASES_URL = "https://github.com/vcpstudio/jkbms/releases/latest";
 const CONTENT_SECURITY_POLICY =
   "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-src 'none'";
 const MIME_TYPES = new Map([
@@ -31,10 +33,12 @@ let pickerWindow;
 let bluetoothSelectionCallback;
 let bluetoothDevices = [];
 let pickerReady = false;
+let updateStatus = { state: "idle" };
 
 app.whenReady()
   .then(() => {
     protocol.handle(APP_SCHEME, serveAppFile);
+    configureAutoUpdater();
     configureBluetoothPermissions();
     configureBluetoothPicker();
     createMainWindow();
@@ -116,6 +120,97 @@ function configureBluetoothPermissions() {
   );
 }
 
+function configureAutoUpdater() {
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = false;
+
+  autoUpdater.on("checking-for-update", () => {
+    publishUpdateStatus({ state: "checking" });
+  });
+  autoUpdater.on("update-available", (info) => {
+    publishUpdateStatus({
+      state: process.platform === "darwin" ? "manual" : "available",
+      version: info.version,
+    });
+  });
+  autoUpdater.on("update-not-available", (info) => {
+    publishUpdateStatus({ state: "current", version: info.version });
+  });
+  autoUpdater.on("download-progress", ({ percent }) => {
+    publishUpdateStatus({
+      state: "downloading",
+      percent: Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0,
+    });
+  });
+  autoUpdater.on("update-downloaded", (info) => {
+    publishUpdateStatus({ state: "downloaded", version: info.version });
+  });
+  autoUpdater.on("error", publishUpdateError);
+
+  ipcMain.handle("app-update:check", (event) => {
+    assertMainWindowSender(event);
+    return checkForUpdates();
+  });
+  ipcMain.handle("app-update:download", async (event) => {
+    assertMainWindowSender(event);
+    if (updateStatus.state !== "available") {
+      throw new Error("Немає доступного для завантаження оновлення.");
+    }
+    try {
+      await autoUpdater.downloadUpdate();
+    } catch (error) {
+      if (updateStatus.state !== "error") publishUpdateError(error);
+      throw error;
+    }
+  });
+  ipcMain.handle("app-update:install", (event) => {
+    assertMainWindowSender(event);
+    if (updateStatus.state !== "downloaded") {
+      throw new Error("Оновлення ще не завантажено.");
+    }
+    autoUpdater.quitAndInstall();
+  });
+  ipcMain.handle("app-update:open-release", async (event) => {
+    assertMainWindowSender(event);
+    await shell.openExternal(RELEASES_URL);
+  });
+}
+
+function assertMainWindowSender(event) {
+  if (event.sender !== mainWindow?.webContents) {
+    throw new Error("Запит оновлення надійшов не з головного вікна.");
+  }
+}
+
+function checkForUpdates() {
+  if (!app.isPackaged) {
+    publishUpdateStatus({
+      state: "error",
+      message: "Перевірка оновлень доступна лише в установленій desktop-версії.",
+    });
+    return Promise.resolve();
+  }
+
+  return autoUpdater.checkForUpdates().catch((error) => {
+    if (updateStatus.state !== "error") publishUpdateError(error);
+  });
+}
+
+function publishUpdateError(error) {
+  console.error("Не вдалося перевірити або встановити оновлення:", error);
+  publishUpdateStatus({
+    state: "error",
+    message: error instanceof Error ? error.message : String(error),
+  });
+}
+
+function publishUpdateStatus(status) {
+  updateStatus = status;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("app-update:status", status);
+  }
+}
+
 function configureBluetoothPicker() {
   ipcMain.on("bluetooth-picker:choose", (event, deviceId) => {
     if (
@@ -142,6 +237,7 @@ function createMainWindow() {
     show: false,
     backgroundColor: "#111512",
     webPreferences: {
+      preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -158,6 +254,10 @@ function createMainWindow() {
 
   mainWindow.webContents.on("will-navigate", (event, url) => {
     if (!isAppOrigin(url)) event.preventDefault();
+  });
+  mainWindow.webContents.on("did-finish-load", () => {
+    publishUpdateStatus(updateStatus);
+    if (app.isPackaged) setTimeout(() => void checkForUpdates(), 5000);
   });
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   mainWindow.on("ready-to-show", () => mainWindow.show());

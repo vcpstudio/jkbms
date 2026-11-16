@@ -40,6 +40,8 @@ jobs:
             release/*.dmg
             release/*.exe
             release/*.AppImage
+            release/*.yml
+            release/*.blockmap
           if-no-files-found: error
           retention-days: 1
 
@@ -60,7 +62,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" release-assets/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "JK BMS Monitor $GITHUB_REF_NAME" \
-            --notes "Перший реліз JK BMS Monitor.
+            --notes "Випуск JK BMS Monitor.
 
           - Моніторинг JK BMS через Bluetooth LE.
           - Окремі історії вимірювань і періодів заряду/розряду для кожного пристрою.

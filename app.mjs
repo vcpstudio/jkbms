@@ -32,6 +32,10 @@ const elements = Object.fromEntries(
   [
     "connection-indicator",
     "connection-state",
+    "app-update-button",
+    "app-update-banner",
+    "app-update-message",
+    "app-update-action",
     "dashboard-grid",
     "layout-toggle",
     "layout-reset",
@@ -156,6 +160,7 @@ elements["flow-newer-events"].addEventListener("click", () => {
   renderFlowTable();
 });
 elements["flow-clear-events"].addEventListener("click", clearFlowEvents);
+setupDesktopUpdates();
 window.addEventListener("beforeunload", () => {
   recordFlowConnectionEnd();
   persistFlowChunk();
@@ -167,6 +172,92 @@ if (!("bluetooth" in navigator)) {
     "error",
   );
   elements["connect-button"].disabled = true;
+}
+
+function setupDesktopUpdates() {
+  const desktop = window.jkbmsDesktop;
+  const checkButton = elements["app-update-button"];
+  if (!desktop) return;
+
+  checkButton.hidden = false;
+  let action;
+  let bannerTimer;
+
+  desktop.onUpdateStatus(renderUpdateStatus);
+  checkButton.addEventListener("click", async () => {
+    try {
+      await desktop.checkForUpdates();
+    } catch (error) {
+      renderUpdateStatus({ state: "error", message: error.message });
+    }
+  });
+  elements["app-update-action"].addEventListener("click", async () => {
+    try {
+      if (action === "download") await desktop.downloadUpdate();
+      else if (action === "install") await desktop.installUpdate();
+      else if (action === "release") await desktop.openReleasePage();
+    } catch (error) {
+      renderUpdateStatus({ state: "error", message: error.message });
+    }
+  });
+
+  function renderUpdateStatus(status) {
+    window.clearTimeout(bannerTimer);
+    action = undefined;
+    elements["app-update-action"].hidden = true;
+    checkButton.disabled = ["checking", "downloading", "downloaded"].includes(status.state);
+    elements["app-update-banner"].dataset.kind = status.state === "error" ? "error" : "info";
+
+    switch (status.state) {
+      case "idle":
+        elements["app-update-banner"].hidden = true;
+        return;
+      case "checking":
+        setUpdateMessage("Перевіряю, чи є нові версії…");
+        return;
+      case "available":
+        setUpdateMessage(`Доступна версія ${status.version}. Завантажити оновлення?`);
+        setUpdateAction("Завантажити", "download");
+        return;
+      case "manual":
+        setUpdateMessage(
+          `Доступна версія ${status.version}. Для цієї непідписаної збірки macOS встанови новий DMG вручну.`,
+        );
+        setUpdateAction("Відкрити реліз", "release");
+        return;
+      case "downloading":
+        setUpdateMessage(`Завантажую оновлення: ${Math.round(status.percent)}%`);
+        return;
+      case "downloaded":
+        setUpdateMessage(`Версію ${status.version} завантажено. Перезапусти застосунок для встановлення.`);
+        setUpdateAction("Перезапустити", "install");
+        return;
+      case "current":
+        setUpdateMessage(`Встановлено останню версію (${status.version}).`);
+        bannerTimer = window.setTimeout(() => {
+          elements["app-update-banner"].hidden = true;
+        }, 6000);
+        return;
+      case "error":
+        setUpdateMessage(`Не вдалося перевірити або завантажити оновлення: ${status.message}`);
+        return;
+      default:
+        console.error("Отримано невідомий стан оновлення:", status);
+        elements["app-update-banner"].hidden = true;
+    }
+  }
+
+  function setUpdateMessage(message) {
+    elements["app-update-message"].textContent = message;
+    elements["app-update-banner"].hidden = false;
+  }
+
+  function setUpdateAction(label, actionName) {
+    const button = elements["app-update-action"];
+    button.textContent = label;
+    button.hidden = false;
+    action = actionName;
+  }
 }
 
 async function connect() {

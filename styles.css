@@ -209,6 +209,27 @@ h1 {
   color: #ffc9b7;
 }
 
+.app-update-banner:not([hidden]) {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 12px 0 0;
+  padding: 10px 14px;
+  border: 1px solid #59653c;
+  border-radius: 8px;
+  background: #202719;
+  color: #d7edaf;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.app-update-banner[data-kind="error"] {
+  border-color: #744840;
+  background: #281c19;
+  color: #ffc9b7;
+}
+
 .dashboard-grid {
   display: grid;
   --dashboard-columns: 4;
@@ -1091,6 +1112,11 @@ h1 {
     flex-wrap: wrap;
     justify-content: flex-end;
     gap: 6px;
+  }
+
+  .app-update-banner:not([hidden]) {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .connection-indicator {

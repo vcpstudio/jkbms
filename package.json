@@ -1,6 +1,6 @@
 {
   "name": "jk-bms-monitor",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Desktop JK BMS Bluetooth LE monitor",
   "main": "electron/main.cjs",
@@ -23,6 +23,13 @@
     "appId": "com.jkbms.monitor",
     "productName": "JK BMS Monitor",
     "asar": true,
+    "publish": {
+      "provider": "github",
+      "owner": "vcpstudio",
+      "repo": "jkbms",
+      "releaseType": "release"
+    },
+    "artifactName": "JK-BMS-Monitor-${version}-${arch}.${ext}",
     "directories": {
       "output": "release"
     },
@@ -51,5 +58,8 @@
     "linux": {
       "target": "AppImage"
     }
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.11"
   }
 }

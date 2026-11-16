@@ -24,6 +24,9 @@
             <span class="status-dot"></span>
             <span id="connection-state">Не підключено</span>
           </span>
+          <button id="app-update-button" class="button button-outline" type="button" hidden>
+            Перевірити оновлення
+          </button>
           <button id="connect-button" class="button button-primary" type="button">
             Підключити BMS
           </button>
@@ -44,6 +47,11 @@
           </button>
         </div>
       </header>
+
+      <div id="app-update-banner" class="app-update-banner" role="status" aria-live="polite" hidden>
+        <span id="app-update-message"></span>
+        <button id="app-update-action" class="button button-outline" type="button" hidden></button>
+      </div>
 
       <section class="intro">
         <div>
