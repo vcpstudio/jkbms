@@ -60,6 +60,8 @@ test("reads JK settings and decodes 24-cell telemetry", () => {
   for (let index = 0; index < 24; index += 1) {
     view.setUint16(6 + index * 2, 3300 + index, true);
   }
+  view.setUint16(64, 18, true);
+  view.setUint16(64 + 23 * 2, 27, true);
   view.setUint32(118, 79200, true);
   view.setInt32(126, -12500, true);
   view.setUint8(141, 80);
@@ -69,6 +71,9 @@ test("reads JK settings and decodes 24-cell telemetry", () => {
 
   const result = decodeLiveData(liveFrame, 24);
   assert.equal(result.cellVoltages.length, 24);
+  assert.equal(result.cellResistances.length, 24);
+  assert.equal(result.cellResistances[0], 0.018);
+  assert.equal(result.cellResistances[23], 0.027);
   assert.equal(result.voltage, 79.2);
   assert.equal(result.current, -12.5);
   assert.equal(result.power, -990);
@@ -82,6 +87,8 @@ test("reads 8-cell telemetry from the JK02_32S field layout", () => {
   for (let index = 0; index < 8; index += 1) {
     view.setUint16(6 + index * 2, 3200 + index, true);
   }
+  view.setUint16(80, 14, true);
+  view.setUint16(80 + 7 * 2, 21, true);
   view.setUint32(150, 102400, true);
   view.setInt32(158, 2500, true);
   view.setUint8(173, 65);
@@ -89,6 +96,9 @@ test("reads 8-cell telemetry from the JK02_32S field layout", () => {
 
   const result = decodeLiveData(liveFrame, 8, "JK02_32S");
   assert.equal(result.cellVoltages.length, 8);
+  assert.equal(result.cellResistances.length, 8);
+  assert.equal(result.cellResistances[0], 0.014);
+  assert.equal(result.cellResistances[7], 0.021);
   assert.equal(result.voltage, 102.4);
   assert.equal(result.current, 2.5);
   assert.equal(result.power, 256);

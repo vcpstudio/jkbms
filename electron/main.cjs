@@ -182,9 +182,9 @@ function showBluetoothPicker() {
   pickerReady = false;
   pickerWindow = new BrowserWindow({
     width: 440,
-    height: 520,
+    height: 620,
     minWidth: 360,
-    minHeight: 360,
+    minHeight: 400,
     parent: mainWindow,
     modal: true,
     resizable: true,

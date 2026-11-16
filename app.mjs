@@ -8,14 +8,25 @@ import {
   decodeSettings,
   detectProtocolVersion,
 } from "./protocol.mjs";
+import {
+  DISCHARGE_FORECAST_WINDOW_MS,
+  estimateDischargeRuntime,
+} from "./discharge-forecast.mjs";
+import { buildFlowPeriods } from "./flow-periods.mjs";
+import { aggregateCellVoltageSamples } from "./voltage-chart-data.mjs";
 
 const LOG_STORAGE_KEY = "jk-bms-monitor.measurements.v1";
+const FLOW_STORAGE_KEY = "jk-bms-monitor.flow-events.v1";
+const BLUETOOTH_PREFERENCES_KEY = "jk-bms-monitor.bluetooth-preferences.v1";
 const DASHBOARD_LAYOUT_KEY = "jk-bms-monitor.dashboard-layout.v1";
 const MAX_SAMPLES = 2000;
+const MAX_FLOW_CHUNK_SAMPLES = 500;
+const FLOW_TABLE_PAGE_SIZE = 100;
 const SAMPLE_INTERVAL_MS = 5000;
 const CHART_SAMPLE_INTERVAL_MS = 1000;
-const CHART_HISTORY_MS = 5 * 60 * 1000;
-const MAX_CHART_SAMPLES = 300;
+const CHART_HISTORY_MS = 30 * 60 * 1000;
+const MAX_CHART_SAMPLES = 1800;
+const MAX_CHART_BUCKETS = 480;
 const CHART_HEIGHT = 260;
 const elements = Object.fromEntries(
   [
@@ -34,6 +45,8 @@ const elements = Object.fromEntries(
     "soc-value",
     "soc-bar",
     "capacity-value",
+    "discharge-runtime-value",
+    "discharge-runtime-detail",
     "voltage-value",
     "average-cell-value",
     "current-value",
@@ -44,6 +57,19 @@ const elements = Object.fromEntries(
     "cell-count-label",
     "voltage-chart",
     "chart-legend",
+    "chart-mode-overview",
+    "chart-mode-heatmap",
+    "chart-mode-cell",
+    "cell-chart-select",
+    "chart-range",
+    "flow-chart",
+    "flow-legend",
+    "flow-period-count",
+    "flow-event-rows",
+    "flow-older-events",
+    "flow-newer-events",
+    "flow-clear-events",
+    "flow-table-page",
     "cells-grid",
     "last-update",
     "model-value",
@@ -72,9 +98,26 @@ let protocolVersion;
 let latestMeasurement;
 let pendingLiveFrame;
 let chartSamples = [];
+let dischargeSamples = [];
+let chartMode = "overview";
+let selectedCellIndex = 0;
+let flowSamples = [];
+let flowPeriods = [];
+let lastFlowCurrent;
+let flowSessionId;
+let flowStoragePrefix;
+let flowChunkIndex = 0;
+let flowChunkSamples = [];
+let flowTablePage = 0;
+let flowStorageWarningShown = false;
+let lastFlowSampleAt;
+let flowSessionClosed = false;
 let lastChartSampleAt = 0;
 let assembler = new FrameAssembler();
-let measurements = loadMeasurements();
+let measurements = [];
+let measurementStorageKey;
+let legacyLogNoticeShown = false;
+let storageMessages = [];
 let lastSavedAt = 0;
 let sampleTimer;
 let noticeTimer;
@@ -82,14 +125,41 @@ let noticeTimer;
 renderLogSummary();
 setupDashboardLayout();
 renderVoltageChart();
+refreshFlowPeriods();
 new ResizeObserver(() => renderVoltageChart()).observe(elements["voltage-chart"]);
+new ResizeObserver(() => renderFlowChart()).observe(elements["flow-chart"]);
 
 elements["connect-button"].addEventListener("click", connect);
 elements["disconnect-button"].addEventListener("click", disconnect);
 elements["refresh-button"].addEventListener("click", requestData);
 elements["settings-button"].addEventListener("click", requestData);
+for (const button of [
+  elements["chart-mode-overview"],
+  elements["chart-mode-heatmap"],
+  elements["chart-mode-cell"],
+]) {
+  button.addEventListener("click", () => setChartMode(button.dataset.chartMode));
+}
+elements["cell-chart-select"].addEventListener("change", () => {
+  selectedCellIndex = Number(elements["cell-chart-select"].value);
+  setChartMode("cell");
+});
+elements["chart-range"].addEventListener("change", renderVoltageChart);
 elements["export-button"].addEventListener("click", exportCsv);
 elements["clear-logs-button"].addEventListener("click", clearLogs);
+elements["flow-older-events"].addEventListener("click", () => {
+  flowTablePage += 1;
+  renderFlowTable();
+});
+elements["flow-newer-events"].addEventListener("click", () => {
+  flowTablePage = Math.max(0, flowTablePage - 1);
+  renderFlowTable();
+});
+elements["flow-clear-events"].addEventListener("click", clearFlowEvents);
+window.addEventListener("beforeunload", () => {
+  recordFlowConnectionEnd();
+  persistFlowChunk();
+});
 
 if (!("bluetooth" in navigator)) {
   showNotice(
@@ -108,11 +178,30 @@ async function connect() {
       acceptAllDevices: true,
       optionalServices: [SERVICE_UUID],
     });
+    const storageId = getDeviceStorageId(device);
+    const usesNameFallback = !device.id;
+    storageMessages = [];
+    measurementStorageKey = makeDeviceStorageKey(LOG_STORAGE_KEY, storageId);
+    flowStoragePrefix = makeDeviceStorageKey(FLOW_STORAGE_KEY, storageId) + ".";
+    measurements = loadMeasurements(measurementStorageKey);
+    flowSamples = enrichFlowSamples(loadFlowSamples(flowStoragePrefix), measurements);
+    flowPeriods = buildFlowPeriods(flowSamples);
+    flowSessionId = crypto.randomUUID();
+    flowChunkIndex = 0;
+    flowChunkSamples = [];
+    flowTablePage = 0;
+    flowStorageWarningShown = false;
+    lastFlowSampleAt = undefined;
+    flowSessionClosed = false;
+    lastFlowCurrent = undefined;
+    renderLogSummary();
+    renderFlowTable();
     settings = undefined;
     protocolVersion = undefined;
     latestMeasurement = undefined;
     pendingLiveFrame = undefined;
     chartSamples = [];
+    dischargeSamples = [];
     lastChartSampleAt = 0;
     lastSavedAt = 0;
     resetTelemetry();
@@ -144,7 +233,22 @@ async function connect() {
     elements["settings-button"].disabled = false;
     showNotice("З’єднання встановлено. Зчитую статус і налаштування.");
     await requestData();
-    sampleTimer = window.setInterval(saveCurrentMeasurement, SAMPLE_INTERVAL_MS);
+    const connectionMessages = [...storageMessages];
+    if (usesNameFallback) {
+      connectionMessages.push(
+        "Bluetooth не надав сталий ID; дані цієї BMS зберігаються за її назвою.",
+      );
+    }
+    if (connectionMessages.length > 0) {
+      showNotice(connectionMessages.join(" "), storageMessages.length > 0 ? "error" : "warning");
+    }
+    recordRecentDevice(device);
+    sampleTimer = window.setInterval(() => {
+      if (latestMeasurement) recordFlowSample(latestMeasurement);
+      saveCurrentMeasurement();
+      persistFlowChunk();
+      refreshFlowPeriods();
+    }, SAMPLE_INTERVAL_MS);
   } catch (error) {
     elements["connect-button"].disabled = false;
     if (error.name === "NotFoundError") {
@@ -152,7 +256,8 @@ async function connect() {
       return;
     }
     if (device?.gatt?.connected) device.gatt.disconnect();
-    showNotice(`Не вдалося підключитися: ${error.message}`, "error");
+    const storageMessage = storageMessages.length ? ` ${storageMessages.join(" ")}` : "";
+    showNotice(`Не вдалося підключитися: ${error.message}${storageMessage}`, "error");
     setConnectionState("Не підключено", false);
   }
 }
@@ -243,14 +348,17 @@ function renderPendingLiveData() {
 
 function renderLiveData(frame) {
   latestMeasurement = decodeLiveData(frame, settings.cellCount, protocolVersion);
+  recordDischargeSample(latestMeasurement);
   renderMeasurement(latestMeasurement);
   recordChartSample(latestMeasurement);
+  recordFlowSample(latestMeasurement);
   saveCurrentMeasurement();
 }
 
 function renderSettings() {
   elements["settings-cell-count"].textContent = String(settings.cellCount);
   elements["cell-count-label"].textContent = `(${settings.cellCount})`;
+  updateCellSelector(settings.cellCount);
   elements["charging-value"].textContent = settings.chargingEnabled ? "Увімкнено" : "Вимкнено";
   elements["discharging-value"].textContent = settings.dischargingEnabled
     ? "Увімкнено"
@@ -273,7 +381,8 @@ function renderMeasurement(measurement) {
   elements["temperature-2-value"].textContent = `${format(measurement.temperature2, 1)} °C`;
   elements["cycles-value"].textContent = String(measurement.cycleCount);
   elements["last-update"].textContent = new Date(measurement.timestamp).toLocaleTimeString("uk-UA");
-  renderCells(measurement.cellVoltages);
+  renderDischargeForecast(estimateDischargeRuntime(dischargeSamples));
+  renderCells(measurement.cellVoltages, measurement.cellResistances);
   renderProtection(measurement.protectionAlerts, measurement.unknownProtectionMask);
 }
 
@@ -296,9 +405,13 @@ function resetTelemetry() {
     "temperature-1-value",
     "temperature-2-value",
     "cycles-value",
+    "discharge-runtime-value",
+    "discharge-runtime-detail",
   ]) {
     elements[id].textContent = "—";
   }
+  dischargeSamples = [];
+  renderDischargeForecast({ status: "unavailable" });
   elements["protection-status"].textContent = "Очікування телеметрії BMS";
   elements["protection-status"].dataset.state = "unknown";
   elements["protection-list"].replaceChildren();
@@ -309,6 +422,7 @@ function resetTelemetry() {
   elements["last-update"].textContent = "Очікування даних";
   elements["settings-button"].textContent = "Налаштування доступні після з’єднання";
   renderVoltageChart([]);
+  renderFlowChart();
   elements["chart-legend"].replaceChildren();
 }
 
@@ -346,7 +460,7 @@ function renderProtection(alerts, unknownMask) {
         : "За останнім кадром активних тривог не зафіксовано";
 }
 
-function renderCells(cellVoltages) {
+function renderCells(cellVoltages, cellResistances) {
   const values = cellVoltages.filter((value) => value > 0);
   if (values.length === 0) {
     elements["cells-grid"].innerHTML = '<p class="empty-state">BMS ще не надіслала напруги комірок.</p>';
@@ -361,14 +475,38 @@ function renderCells(cellVoltages) {
     const cell = document.createElement("div");
     const label = document.createElement("span");
     const value = document.createElement("span");
+    const resistance = document.createElement("span");
     cell.className = "cell";
+    cell.dataset.cellIndex = String(index);
+    cell.setAttribute("role", "button");
+    cell.setAttribute(
+      "aria-label",
+      `Вибрати комірку ${index + 1} для детального графіка`,
+    );
+    cell.setAttribute("aria-pressed", String(chartMode === "cell" && selectedCellIndex === index));
+    cell.tabIndex = 0;
+    if (chartMode === "cell" && selectedCellIndex === index) {
+      cell.classList.add("is-chart-selected");
+    }
     if (voltage === min) cell.classList.add("is-low");
     if (voltage === max) cell.classList.add("is-high");
     label.className = "cell-number";
     label.textContent = `CELL ${String(index + 1).padStart(2, "0")}`;
     value.className = "cell-voltage";
     value.textContent = voltage > 0 ? voltage.toFixed(3) : "—";
-    cell.append(label, value);
+    resistance.className = "cell-resistance";
+    const resistanceValue = cellResistances[index];
+    resistance.textContent =
+      Number.isFinite(resistanceValue) && resistanceValue > 0
+        ? `Опір ${Math.round(resistanceValue * 1000)} mΩ`
+        : "Опір —";
+    cell.append(label, value, resistance);
+    cell.addEventListener("click", () => selectCellForChart(index));
+    cell.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      selectCellForChart(index);
+    });
     fragment.append(cell);
   });
 
@@ -379,7 +517,10 @@ function recordChartSample(measurement) {
   const timestamp = Date.parse(measurement.timestamp);
   if (timestamp - lastChartSampleAt < CHART_SAMPLE_INTERVAL_MS) return;
 
-  chartSamples.push({ timestamp, cellVoltages: [...measurement.cellVoltages] });
+  chartSamples.push({
+    timestamp,
+    cellVoltages: [...measurement.cellVoltages],
+  });
   lastChartSampleAt = timestamp;
   const oldestAllowed = timestamp - CHART_HISTORY_MS;
   chartSamples = chartSamples
@@ -388,14 +529,283 @@ function recordChartSample(measurement) {
   renderVoltageChart();
 }
 
+function recordDischargeSample(measurement) {
+  const timestamp = Date.parse(measurement.timestamp);
+  dischargeSamples.push({
+    timestamp,
+    current: measurement.current,
+    power: measurement.power,
+    remainingCapacity: measurement.remainingCapacity,
+  });
+  const oldestAllowed = timestamp - DISCHARGE_FORECAST_WINDOW_MS;
+  dischargeSamples = dischargeSamples
+    .filter((sample) => sample.timestamp >= oldestAllowed)
+    .slice(-1800);
+}
+
+function renderDischargeForecast(forecast) {
+  const value = elements["discharge-runtime-value"];
+  const detail = elements["discharge-runtime-detail"];
+  const card = value.closest(".metric-card");
+  card.dataset.state = forecast.status;
+
+  if (forecast.status === "discharging") {
+    value.textContent = formatDischargeDuration(forecast.runtimeHours);
+    const consumption = Number.isFinite(forecast.averagePower)
+      ? forecast.averagePower >= 1000
+        ? `${(forecast.averagePower / 1000).toFixed(1)} kW`
+        : `${forecast.averagePower.toFixed(0)} W`
+      : "";
+    const source = forecast.method === "average" ? "Середнє" : "Поточне";
+    detail.textContent =
+      `${source}: ${forecast.averageCurrent.toFixed(1)} A` +
+      (consumption ? ` · ${consumption}` : "");
+    detail.title =
+      `Оцінка за ${forecast.method === "average" ? "середнім" : "поточним"} струмом розряду` +
+      (forecast.method === "average" ? " за доступний період до 5 хв" : "") +
+      ` ${forecast.averageCurrent.toFixed(2)} A; залишкова ємність BMS ` +
+      `${forecast.remainingCapacity.toFixed(2)} Ah.`;
+    return;
+  }
+
+  value.textContent = "—";
+  detail.removeAttribute("title");
+  detail.textContent =
+    forecast.status === "charging"
+      ? "Заряджається — прогноз розряду неактивний"
+      : forecast.status === "idle"
+        ? "Немає розрядного навантаження"
+        : forecast.status === "depleted"
+          ? "Залишкова ємність вичерпана"
+          : forecast.status === "disconnected"
+            ? "Немає активного з’єднання"
+            : "Оцінка з’явиться під час розряду";
+}
+
+function formatDischargeDuration(runtimeHours) {
+  const totalMinutes = Math.round(runtimeHours * 60);
+  if (totalMinutes < 1) return "<1 хв";
+
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days} д ${hours} год`;
+  if (hours === 0) return `${minutes} хв`;
+  return minutes > 0 ? `${hours} год ${minutes} хв` : `${hours} год`;
+}
+
+function recordFlowSample(measurement) {
+  const timestamp = Date.parse(measurement.timestamp);
+  const current = measurement.current;
+  const previousCurrent = lastFlowCurrent;
+  const currentChanged = current !== previousCurrent;
+  const sampleDue =
+    current !== 0 &&
+    (lastFlowSampleAt === undefined || timestamp - lastFlowSampleAt >= SAMPLE_INTERVAL_MS);
+  lastFlowCurrent = current;
+
+  if (flowSessionClosed || (!currentChanged && !sampleDue)) return;
+
+  const sample = {
+    timestamp,
+    current,
+    voltage: measurement.voltage,
+    power: measurement.power,
+    stateOfCharge: measurement.stateOfCharge,
+    sessionId: flowSessionId,
+  };
+  flowSamples.push(sample);
+  flowChunkSamples.push([
+    timestamp,
+    current,
+    measurement.voltage,
+    measurement.power,
+    measurement.stateOfCharge,
+  ]);
+  lastFlowSampleAt = timestamp;
+  persistFlowChunk();
+  flowTablePage = 0;
+}
+
+function recordFlowConnectionEnd() {
+  if (flowSessionClosed || !flowStoragePrefix || !flowSessionId || !latestMeasurement) return;
+
+  const timestamp = Math.max(Date.now(), Date.parse(latestMeasurement.timestamp));
+  const sample = {
+    timestamp,
+    current: latestMeasurement.current,
+    voltage: latestMeasurement.voltage,
+    power: latestMeasurement.power,
+    stateOfCharge: latestMeasurement.stateOfCharge,
+    sessionId: flowSessionId,
+    kind: "connection-end",
+  };
+  flowSamples.push(sample);
+  flowChunkSamples.push([
+    timestamp,
+    sample.current,
+    sample.voltage,
+    sample.power,
+    sample.stateOfCharge,
+    sample.kind,
+  ]);
+  flowSessionClosed = true;
+  persistFlowChunk();
+  refreshFlowPeriods();
+}
+
+function persistFlowChunk() {
+  if (!flowStoragePrefix || flowChunkSamples.length === 0) return;
+
+  const chunkKey = `${flowStoragePrefix}${flowSessionId}.${flowChunkIndex}`;
+  try {
+    localStorage.setItem(chunkKey, JSON.stringify(flowChunkSamples));
+    flowStorageWarningShown = false;
+    if (flowChunkSamples.length >= MAX_FLOW_CHUNK_SAMPLES) {
+      flowChunkIndex += 1;
+      flowChunkSamples = [];
+    }
+  } catch (error) {
+    if (!flowStorageWarningShown) {
+      showNotice(`Не вдалося зберегти події струму для цієї BMS: ${error.message}`, "error");
+      flowStorageWarningShown = true;
+    }
+  }
+}
+
+function refreshFlowPeriods() {
+  flowPeriods = buildFlowPeriods(flowSamples);
+  renderFlowTable();
+  renderFlowChart();
+}
+
+function renderFlowTable() {
+  const periods = flowPeriods;
+  const pageCount = Math.max(1, Math.ceil(periods.length / FLOW_TABLE_PAGE_SIZE));
+  flowTablePage = Math.min(flowTablePage, pageCount - 1);
+  const end = periods.length - flowTablePage * FLOW_TABLE_PAGE_SIZE;
+  const start = Math.max(0, end - FLOW_TABLE_PAGE_SIZE);
+  const visiblePeriods = periods.slice(start, end).reverse();
+  const rows = visiblePeriods.map((period) => {
+    const row = document.createElement("tr");
+    const time = document.createElement("td");
+    const type = document.createElement("td");
+    const duration = document.createElement("td");
+    const stateOfCharge = document.createElement("td");
+    const energy = document.createElement("td");
+    const voltage = document.createElement("td");
+    const current = document.createElement("td");
+    const endMarker = period.endBoundaryKnown ? "" : "≈ ";
+
+    row.className = `flow-event-${period.direction}`;
+    time.textContent =
+      `${period.startBoundaryKnown ? "" : "≈ "}${formatFlowTimestamp(period.startTimestamp)} – ` +
+      `${endMarker}${formatFlowTimestamp(period.endTimestamp)}${flowPeriodStatus(period.status)}`;
+    type.textContent = period.direction === "charge" ? "Заряджання" : "Розряджання";
+    duration.textContent = formatFlowDuration(period.activeDurationMs);
+    stateOfCharge.textContent = formatFlowSoc(period);
+    energy.textContent = Number.isFinite(period.energyKwh)
+      ? period.energyKwh.toFixed(3)
+      : "—";
+    voltage.textContent = Number.isFinite(period.averageVoltage)
+      ? period.averageVoltage.toFixed(1)
+      : "—";
+    current.textContent =
+      Number.isFinite(period.minCurrent) && Number.isFinite(period.maxCurrent)
+        ? `${period.minCurrent.toFixed(1)}–${period.maxCurrent.toFixed(1)}`
+        : "—";
+    row.append(time, type, duration, stateOfCharge, energy, voltage, current);
+    return row;
+  });
+
+  elements["flow-event-rows"].replaceChildren(
+    ...(rows.length ? rows : [createEmptyFlowTableRow()]),
+  );
+  elements["flow-period-count"].textContent = `Періоди: ${periods.length}`;
+  elements["flow-table-page"].textContent = periods.length
+    ? `${start + 1}–${end} з ${periods.length}`
+    : "Періодів ще немає";
+  elements["flow-older-events"].disabled = start === 0;
+  elements["flow-newer-events"].disabled = flowTablePage === 0;
+  elements["flow-clear-events"].disabled = flowSamples.length === 0;
+}
+
+function formatFlowTimestamp(timestamp) {
+  return new Date(timestamp).toLocaleString("uk-UA", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function formatFlowDuration(durationMs) {
+  const totalSeconds = Math.floor(durationMs / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  if (hours > 0) return `${hours} год ${minutes} хв`;
+  if (minutes > 0) return `${minutes} хв ${totalSeconds % 60} с`;
+  return `${totalSeconds} с`;
+}
+
+function formatFlowSoc(period) {
+  if (!Number.isFinite(period.startSoc) || !Number.isFinite(period.endSoc)) return "—";
+  const change = period.endSoc - period.startSoc;
+  const changeLabel = `${change > 0 ? "+" : ""}${change.toFixed(0)}%`;
+  return `${period.startSoc.toFixed(0)}→${period.endSoc.toFixed(0)}% (${changeLabel})`;
+}
+
+function flowPeriodStatus(status) {
+  if (status === "active") return " (триває)";
+  if (status === "paused") return " (пауза)";
+  if (status === "connection-ended") return " (від’єднано)";
+  if (status === "interrupted") return " (перервано)";
+  return "";
+}
+
+function createEmptyFlowTableRow() {
+  const row = document.createElement("tr");
+  const cell = document.createElement("td");
+  cell.colSpan = 7;
+  cell.className = "flow-table-empty";
+  cell.textContent = "Періодів заряду або розряду ще не зафіксовано";
+  row.append(cell);
+  return row;
+}
+
+function clearFlowEvents() {
+  if (!flowStoragePrefix) return;
+  if (!window.confirm("Видалити історію заряду та розряду цієї BMS?")) return;
+
+  try {
+    const keys = [];
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (key?.startsWith(flowStoragePrefix)) keys.push(key);
+    }
+    for (const key of keys) localStorage.removeItem(key);
+    flowSamples = [];
+    flowChunkSamples = [];
+    flowChunkIndex = 0;
+    lastFlowCurrent = undefined;
+    lastFlowSampleAt = undefined;
+    flowTablePage = 0;
+    flowSessionClosed = !device?.gatt?.connected;
+    refreshFlowPeriods();
+    showNotice("Історію подій струму цієї BMS очищено.");
+  } catch (error) {
+    showNotice(`Не вдалося очистити історію цієї BMS: ${error.message}`, "error");
+  }
+}
+
 function renderVoltageChart() {
   const chart = elements["voltage-chart"];
-  const namespace = "http://www.w3.org/2000/svg";
   const chartWidth = chart.clientWidth || 800;
   chart.setAttribute("viewBox", `0 0 ${chartWidth} ${CHART_HEIGHT}`);
   chart.replaceChildren();
   elements["chart-legend"].replaceChildren();
-  chart.setAttribute("aria-label", "Графік напруги комірок у часі");
 
   if (chartSamples.length === 0) {
     const empty = svgElement("text", {
@@ -410,22 +820,49 @@ function renderVoltageChart() {
   }
 
   const bounds = { left: 72, right: chartWidth - 18, top: 20, bottom: 204 };
-  const cellCount = Math.max(...chartSamples.map((sample) => sample.cellVoltages.length));
-  const voltages = chartSamples.flatMap((sample) => sample.cellVoltages).filter((value) => value > 0);
-  if (voltages.length === 0) return;
+  const rangeMs = Number(elements["chart-range"].value);
+  const lastTimestamp = chartSamples.at(-1).timestamp;
+  const firstTimestamp = lastTimestamp - rangeMs;
+  const visibleSamples = chartSamples.filter((sample) => sample.timestamp >= firstTimestamp);
+  const cellCount = Math.max(...visibleSamples.map((sample) => sample.cellVoltages.length));
+  const selectedVoltages =
+    chartMode === "cell"
+      ? visibleSamples.map((sample) => sample.cellVoltages[selectedCellIndex])
+      : visibleSamples.flatMap((sample) => sample.cellVoltages);
+  const voltages = selectedVoltages.filter((value) => Number.isFinite(value) && value > 0);
+  if (voltages.length === 0) {
+    const empty = svgElement("text", {
+      class: "chart-empty",
+      x: chartWidth / 2,
+      y: 126,
+      "text-anchor": "middle",
+    });
+    empty.textContent = "Для цього періоду ще немає даних";
+    chart.append(empty);
+    return;
+  }
+
   const dataMin = Math.min(...voltages);
   const dataMax = Math.max(...voltages);
-  const padding = Math.max((dataMax - dataMin) * 0.3, 0.005);
+  const padding = Math.max((dataMax - dataMin) * 0.25, 0.005);
   const minVoltage = Math.floor((dataMin - padding) * 1000) / 1000;
   const maxVoltage = Math.ceil((dataMax + padding) * 1000) / 1000;
   const voltageRange = maxVoltage - minVoltage || 0.01;
-  const firstTimestamp = chartSamples[0].timestamp;
-  const lastTimestamp = chartSamples.at(-1).timestamp;
-  const timeRange = Math.max(lastTimestamp - firstTimestamp, 1000);
+  const timeRange = rangeMs;
   const x = (timestamp) =>
     bounds.left + ((timestamp - firstTimestamp) / timeRange) * (bounds.right - bounds.left);
   const y = (voltage) =>
     bounds.bottom - ((voltage - minVoltage) / voltageRange) * (bounds.bottom - bounds.top);
+  const maxBuckets = Math.max(
+    1,
+    Math.min(MAX_CHART_BUCKETS, Math.floor(bounds.right - bounds.left)),
+  );
+  const buckets = aggregateCellVoltageSamples(
+    visibleSamples,
+    maxBuckets,
+    firstTimestamp,
+    lastTimestamp,
+  );
 
   for (let tick = 0; tick <= 4; tick += 1) {
     const value = minVoltage + (voltageRange * tick) / 4;
@@ -480,73 +917,375 @@ function renderVoltageChart() {
   axisTitle.textContent = "Час";
   chart.append(axisTitle);
 
-  for (let cellIndex = 0; cellIndex < cellCount; cellIndex += 1) {
-    const color = `hsl(${(cellIndex * 137.508 + 85) % 360} 68% 70%)`;
-    const points = chartSamples
-      .map((sample) => ({
-        timestamp: sample.timestamp,
-        voltage: sample.cellVoltages[cellIndex],
-      }))
-      .filter(({ voltage }) => Number.isFinite(voltage) && voltage > 0);
-    if (points.length === 0) continue;
+  if (chartMode === "heatmap") {
+    renderVoltageHeatmap(chart, buckets, bounds, dataMin, dataMax, cellCount);
+  } else {
+    const selectedCell = chartMode === "cell" ? selectedCellIndex : undefined;
+    const series = buckets
+      .map((bucket) => {
+        if (selectedCell === undefined) {
+          return {
+            timestamp: bucket.timestamp,
+            minimum: bucket.minimum,
+            maximum: bucket.maximum,
+            average: bucket.average,
+          };
+        }
+        const cell = bucket.cells[selectedCell];
+        return cell ? { timestamp: bucket.timestamp, ...cell } : undefined;
+      })
+      .filter((point) => point && Number.isFinite(point.average));
+    if (series.length === 0) return;
 
-    const linePath = points
+    const upperPath = series
       .map(
-        ({ timestamp, voltage }, pointIndex) =>
-          `${pointIndex === 0 ? "M" : "L"} ${x(timestamp)} ${y(voltage)}`,
+        (point, index) =>
+          `${index === 0 ? "M" : "L"} ${x(point.timestamp)} ${y(point.maximum)}`,
       )
       .join(" ");
-    const line = svgElement("path", {
-      class: "chart-line",
-      d: linePath,
-      stroke: color,
+    const lowerPath = [...series]
+      .reverse()
+      .map((point) => `L ${x(point.timestamp)} ${y(point.minimum)}`)
+      .join(" ");
+    const rangeBand = svgElement("path", {
+      class: "chart-range-band",
+      d: `${upperPath} ${lowerPath} Z`,
     });
-    const title = svgElement("title");
-    title.textContent = `Комірка ${cellIndex + 1}: ${points.at(-1).voltage.toFixed(3)} V`;
-    line.append(title);
-    chart.append(line);
+    const bandTitle = svgElement("title");
+    bandTitle.textContent = "Діапазон мінімальної та максимальної напруги";
+    rangeBand.append(bandTitle);
+    chart.append(rangeBand);
 
-    const legendItem = document.createElement("span");
-    const swatch = document.createElement("i");
-    const label = document.createElement("span");
-    legendItem.className = "chart-legend-item";
-    swatch.className = "chart-legend-swatch";
-    swatch.style.backgroundColor = color;
-    label.textContent = `Комірка ${cellIndex + 1}`;
-    legendItem.append(swatch, label);
-    elements["chart-legend"].append(legendItem);
+    const averagePath = series
+      .map(
+        (point, index) =>
+          `${index === 0 ? "M" : "L"} ${x(point.timestamp)} ${y(point.average)}`,
+      )
+      .join(" ");
+    const averageLine = svgElement("path", {
+      class: "chart-average-line",
+      d: averagePath,
+    });
+    const averageTitle = svgElement("title");
+    averageTitle.textContent =
+      selectedCell === undefined
+        ? "Середня напруга всіх комірок"
+        : `Середня напруга комірки ${selectedCell + 1}`;
+    averageLine.append(averageTitle);
+    chart.append(averageLine);
 
-    const latestPoint = points.at(-1);
+    const latestPoint = series.at(-1);
     const marker = svgElement("circle", {
       class: "chart-point",
       cx: x(latestPoint.timestamp),
-      cy: y(latestPoint.voltage),
+      cy: y(latestPoint.average),
       r: 3,
-      fill: color,
-      stroke: color,
+      fill: "#b7f36a",
+      stroke: "#b7f36a",
     });
     const markerTitle = svgElement("title");
-    markerTitle.textContent = `${formatTime(latestPoint.timestamp)} · комірка ${cellIndex + 1}: ${latestPoint.voltage.toFixed(3)} V`;
+    markerTitle.textContent = `${latestPoint.average.toFixed(3)} V`;
     marker.append(markerTitle);
     chart.append(marker);
+
+    renderChartLegend([
+      { kind: "range", label: "Мінімум – максимум" },
+      { color: "#b7f36a", label: selectedCell === undefined ? "Середнє всіх комірок" : "Середнє комірки" },
+    ]);
   }
 
   chart.setAttribute(
     "aria-label",
-    `Історія напруги ${cellCount} комірок за ${Math.round(timeRange / 1000)} секунд. Діапазон: ${dataMin.toFixed(3)}–${dataMax.toFixed(3)} V.`,
+    chartMode === "heatmap"
+      ? `Теплова карта напруги ${cellCount} комірок за ${elements["chart-range"].selectedOptions[0].textContent}.`
+      : chartMode === "cell"
+        ? `Детальний графік напруги комірки ${selectedCellIndex + 1}.`
+        : `Огляд мінімальної, середньої та максимальної напруги ${cellCount} комірок.`,
   );
+}
 
-  function svgElement(tagName, attributes = {}) {
-    const element = document.createElementNS(namespace, tagName);
-    for (const [name, value] of Object.entries(attributes)) {
-      element.setAttribute(name, String(value));
-    }
-    return element;
+function renderVoltageHeatmap(chart, buckets, bounds, dataMin, dataMax, cellCount) {
+  const bucketCount = buckets[0].bucketCount;
+  const rowHeight = (bounds.bottom - bounds.top) / cellCount;
+  const canvas = document.createElement("canvas");
+  canvas.width = bucketCount;
+  canvas.height = cellCount;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Не вдалося створити теплову карту напруги.");
+  const imageData = context.createImageData(bucketCount, cellCount);
+
+  for (const bucket of buckets) {
+    bucket.cells.forEach((cell, cellIndex) => {
+      if (!cell) return;
+      const pixelOffset = (cellIndex * bucketCount + bucket.index) * 4;
+      const [red, green, blue] = voltageHeatmapRgb(cell.average, dataMin, dataMax);
+      imageData.data[pixelOffset] = red;
+      imageData.data[pixelOffset + 1] = green;
+      imageData.data[pixelOffset + 2] = blue;
+      imageData.data[pixelOffset + 3] = 255;
+    });
   }
+  context.putImageData(imageData, 0, 0);
+
+  const image = svgElement("image", {
+    x: bounds.left,
+    y: bounds.top,
+    width: bounds.right - bounds.left,
+    height: bounds.bottom - bounds.top,
+    preserveAspectRatio: "none",
+    href: canvas.toDataURL("image/png"),
+  });
+  const title = svgElement("title");
+  title.textContent =
+    `Теплова карта: ${cellCount} комірок, напруга ${dataMin.toFixed(3)}–${dataMax.toFixed(3)} V`;
+  image.append(title);
+  chart.insertBefore(image, chart.firstChild);
+
+  const labelStep = Math.max(1, Math.ceil(cellCount / 10));
+  for (let cellIndex = 0; cellIndex < cellCount; cellIndex += labelStep) {
+    const label = svgElement("text", {
+      class: "chart-axis-label",
+      x: bounds.left - 10,
+      y: bounds.top + (cellIndex + 0.5) * rowHeight + 3,
+      "text-anchor": "end",
+    });
+    label.textContent = String(cellIndex + 1);
+    chart.append(label);
+  }
+
+  renderChartLegend([
+    { color: voltageHeatmapColor(dataMin, dataMin, dataMax), label: `${dataMin.toFixed(3)} V` },
+    {
+      color: voltageHeatmapColor((dataMin + dataMax) / 2, dataMin, dataMax),
+      label: `${((dataMin + dataMax) / 2).toFixed(3)} V`,
+    },
+    { color: voltageHeatmapColor(dataMax, dataMin, dataMax), label: `${dataMax.toFixed(3)} V` },
+  ]);
+}
+
+function voltageHeatmapColor(value, minimum, maximum) {
+  return `rgb(${voltageHeatmapRgb(value, minimum, maximum).join(" ")})`;
+}
+
+function voltageHeatmapRgb(value, minimum, maximum) {
+  const stops = [
+    { position: 0, color: [56, 109, 160] },
+    { position: 0.5, color: [87, 166, 112] },
+    { position: 1, color: [224, 194, 83] },
+  ];
+  const ratio = maximum === minimum ? 0.5 : Math.max(0, Math.min(1, (value - minimum) / (maximum - minimum)));
+  const stopIndex = ratio <= 0.5 ? 0 : 1;
+  const start = stops[stopIndex];
+  const end = stops[stopIndex + 1];
+  const localRatio = (ratio - start.position) / (end.position - start.position);
+  const rgb = start.color.map((channel, index) =>
+    Math.round(channel + (end.color[index] - channel) * localRatio),
+  );
+  return rgb;
+}
+
+function renderChartLegend(items) {
+  elements["chart-legend"].replaceChildren(
+    ...items.map(({ color, kind, label }) => {
+      const item = document.createElement("span");
+      const swatch = document.createElement("i");
+      const text = document.createElement("span");
+      item.className = "chart-legend-item";
+      swatch.className = `chart-legend-swatch${kind === "range" ? " is-range" : ""}`;
+      if (color) swatch.style.backgroundColor = color;
+      text.textContent = label;
+      item.append(swatch, text);
+      return item;
+    }),
+  );
+}
+
+function updateCellSelector(cellCount) {
+  const select = elements["cell-chart-select"];
+  if (select.options.length !== cellCount) {
+    select.replaceChildren(
+      ...Array.from({ length: cellCount }, (_, index) => {
+        const option = document.createElement("option");
+        option.value = String(index);
+        option.textContent = `Комірка ${index + 1}`;
+        return option;
+      }),
+    );
+  }
+  selectedCellIndex = Math.min(selectedCellIndex, cellCount - 1);
+  select.value = String(selectedCellIndex);
+}
+
+function selectCellForChart(cellIndex) {
+  selectedCellIndex = cellIndex;
+  elements["cell-chart-select"].value = String(cellIndex);
+  setChartMode("cell");
+}
+
+function setChartMode(mode) {
+  if (!["overview", "heatmap", "cell"].includes(mode)) {
+    throw new Error(`Невідомий режим графіка напруги: ${mode}.`);
+  }
+  chartMode = mode;
+  for (const button of [
+    elements["chart-mode-overview"],
+    elements["chart-mode-heatmap"],
+    elements["chart-mode-cell"],
+  ]) {
+    const active = button.dataset.chartMode === chartMode;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+  }
+  for (const cell of elements["cells-grid"].querySelectorAll(".cell")) {
+    const active =
+      chartMode === "cell" && Number(cell.dataset.cellIndex) === selectedCellIndex;
+    cell.classList.toggle("is-chart-selected", active);
+    cell.setAttribute("aria-pressed", String(active));
+  }
+  renderVoltageChart();
+}
+
+function renderFlowChart() {
+  const chart = elements["flow-chart"];
+  const periods = flowPeriods;
+  const containerWidth = chart.parentElement.clientWidth || 800;
+  const chartWidth = Math.max(containerWidth, periods.length * 52 + 100);
+  chart.style.width = `${chartWidth}px`;
+  chart.setAttribute("viewBox", `0 0 ${chartWidth} ${CHART_HEIGHT}`);
+  chart.replaceChildren();
+  elements["flow-legend"].replaceChildren();
+  chart.setAttribute("aria-label", "Стовпчиковий графік періодів заряду та розряду батареї");
+
+  if (periods.length === 0) {
+    const empty = svgElement("text", {
+      class: "chart-empty",
+      x: chartWidth / 2,
+      y: 126,
+      "text-anchor": "middle",
+    });
+    empty.textContent = "Періоди заряду й розряду з’являться після вимірювань";
+    chart.append(empty);
+    return;
+  }
+
+  const bounds = { left: 72, right: chartWidth - 18, top: 22, bottom: 206 };
+  const maxEnergy = periods.reduce(
+    (maximum, period) => Math.max(maximum, period.energyKwh || 0),
+    0,
+  );
+  const energyRange = Math.max(0.001, Math.ceil(maxEnergy * 1.1 * 1000) / 1000);
+  const zeroY = (bounds.top + bounds.bottom) / 2;
+  const y = (energy) =>
+    zeroY - (energy / energyRange) * ((bounds.bottom - bounds.top) / 2);
+
+  for (let tick = -2; tick <= 2; tick += 1) {
+    const value = (energyRange * tick) / 2;
+    const lineY = y(value);
+    chart.append(
+      svgElement("line", {
+        class: tick === 0 ? "flow-zero-line" : "chart-grid-line",
+        x1: bounds.left,
+        x2: bounds.right,
+        y1: lineY,
+        y2: lineY,
+      }),
+    );
+    const label = svgElement("text", {
+      class: "chart-axis-label",
+      x: bounds.left - 10,
+      y: lineY + 3,
+      "text-anchor": "end",
+    });
+    label.textContent = `${value.toFixed(energyRange < 0.01 ? 4 : 3)} kWh`;
+    chart.append(label);
+  }
+
+  const groupWidth = (bounds.right - bounds.left) / periods.length;
+  const barWidth = Math.min(30, groupWidth * 0.62);
+  const labelEvery = Math.max(1, Math.ceil(100 / groupWidth));
+  periods.forEach((period, index) => {
+    const energy = period.energyKwh || 0;
+    const signedEnergy = period.direction === "charge" ? energy : -energy;
+    const barY = Math.min(zeroY, y(signedEnergy));
+    const barHeight = Math.max(1, Math.abs(y(signedEnergy) - zeroY));
+    const bar = svgElement("rect", {
+      class: `flow-bar flow-${period.direction}-bar`,
+      x: bounds.left + groupWidth * (index + 0.5) - barWidth / 2,
+      y: barY,
+      width: barWidth,
+      height: barHeight,
+      rx: 2,
+    });
+    const title = svgElement("title");
+    title.textContent = [
+      period.direction === "charge" ? "Заряджання" : "Розряджання",
+      `${formatFlowTimestamp(period.startTimestamp)} – ${formatFlowTimestamp(period.endTimestamp)}`,
+      `Час: ${formatFlowDuration(period.activeDurationMs)}`,
+      `SOC: ${formatFlowSoc(period)}`,
+      `Енергія: ${Number.isFinite(period.energyKwh) ? `${period.energyKwh.toFixed(3)} kWh` : "—"}`,
+      `Середня напруга: ${Number.isFinite(period.averageVoltage) ? `${period.averageVoltage.toFixed(1)} V` : "—"}`,
+      `Струм: ${period.minCurrent.toFixed(1)}–${period.maxCurrent.toFixed(1)} A`,
+    ].join("\n");
+    bar.append(title);
+    chart.append(bar);
+
+    if (index % labelEvery === 0 || index === periods.length - 1) {
+      const label = svgElement("text", {
+        class: "chart-x-label",
+        x: bounds.left + groupWidth * (index + 0.5),
+        y: bounds.bottom + 22,
+        "text-anchor": "middle",
+      });
+      label.textContent = new Date(period.startTimestamp).toLocaleString("uk-UA", {
+        day: "2-digit",
+        month: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+      chart.append(label);
+    }
+  });
+
+  const axisTitle = svgElement("text", {
+    class: "chart-x-label",
+    x: (bounds.left + bounds.right) / 2,
+    y: 249,
+    "text-anchor": "middle",
+  });
+  axisTitle.textContent = "Періоди заряду та розряду · енергія, kWh";
+  chart.append(axisTitle);
+
+  for (const [label, color] of [
+    ["Заряджання (+)", "#b7f36a"],
+    ["Розряджання (−)", "#ff9770"],
+  ]) {
+    const legendItem = document.createElement("span");
+    const swatch = document.createElement("i");
+    const legendLabel = document.createElement("span");
+    legendItem.className = "chart-legend-item";
+    swatch.className = "chart-legend-swatch";
+    swatch.style.backgroundColor = color;
+    legendLabel.textContent = label;
+    legendItem.append(swatch, legendLabel);
+    elements["flow-legend"].append(legendItem);
+  }
+
+  chart.setAttribute(
+    "aria-label",
+    `Стовпчики показують енергію в kWh за ${periods.length} періодів заряду та розряду.`,
+  );
+}
+
+function svgElement(tagName, attributes = {}) {
+  const element = document.createElementNS("http://www.w3.org/2000/svg", tagName);
+  for (const [name, value] of Object.entries(attributes)) {
+    element.setAttribute(name, String(value));
+  }
+  return element;
 }
 
 function saveCurrentMeasurement() {
-  if (!latestMeasurement || !settings) return;
+  if (!latestMeasurement || !settings || !measurementStorageKey) return;
   const timestamp = Date.parse(latestMeasurement.timestamp);
   if (timestamp - lastSavedAt < SAMPLE_INTERVAL_MS) return;
   lastSavedAt = timestamp;
@@ -559,7 +1298,7 @@ function saveCurrentMeasurement() {
   const nextMeasurements = [...measurements, snapshot].slice(-MAX_SAMPLES);
 
   try {
-    localStorage.setItem(LOG_STORAGE_KEY, JSON.stringify(nextMeasurements));
+    localStorage.setItem(measurementStorageKey, JSON.stringify(nextMeasurements));
     measurements = nextMeasurements;
     lastSavedAt = timestamp;
     renderLogSummary();
@@ -568,16 +1307,135 @@ function saveCurrentMeasurement() {
   }
 }
 
-function loadMeasurements() {
+function loadMeasurements(storageKey) {
   try {
-    const stored = localStorage.getItem(LOG_STORAGE_KEY);
+    const stored = localStorage.getItem(storageKey);
+    if (!stored && storageKey !== LOG_STORAGE_KEY && localStorage.getItem(LOG_STORAGE_KEY)) {
+      if (!legacyLogNoticeShown) {
+        storageMessages.push(
+          "Знайдено старий спільний журнал без ідентифікатора BMS; нові вимірювання зберігатимуться окремо.",
+        );
+        legacyLogNoticeShown = true;
+      }
+    }
     if (!stored) return [];
     const parsed = JSON.parse(stored);
-    return Array.isArray(parsed) ? parsed.slice(-MAX_SAMPLES) : [];
+    if (
+      !Array.isArray(parsed) ||
+      !parsed.every(
+        (entry) =>
+          entry &&
+          typeof entry === "object" &&
+          !Array.isArray(entry) &&
+          typeof entry.timestamp === "string" &&
+          Number.isFinite(Date.parse(entry.timestamp)) &&
+          Array.isArray(entry.cellVoltages),
+      )
+    ) {
+      throw new Error("Неправильний формат журналу вимірювань.");
+    }
+    return parsed.slice(-MAX_SAMPLES);
   } catch (error) {
-    showNotice(`Не вдалося прочитати локальний журнал: ${error.message}`, "error");
+    storageMessages.push(`Не вдалося прочитати локальний журнал: ${error.message}`);
     return [];
   }
+}
+
+function loadFlowSamples(storagePrefix) {
+  try {
+    const chunkKeys = [];
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (key?.startsWith(storagePrefix)) chunkKeys.push(key);
+    }
+
+    const samples = [];
+    for (const key of chunkKeys) {
+      const suffix = key.slice(storagePrefix.length);
+      const separator = suffix.lastIndexOf(".");
+      if (separator <= 0) throw new Error(`Некоректний ключ історії: ${key}`);
+      const sessionId = suffix.slice(0, separator);
+      const chunk = JSON.parse(localStorage.getItem(key) || "null");
+      if (!Array.isArray(chunk)) throw new Error(`Некоректний блок історії: ${key}`);
+      for (const entry of chunk) {
+        if (
+          !Array.isArray(entry) ||
+          ![2, 5, 6].includes(entry.length) ||
+          !Number.isFinite(entry[0]) ||
+          !Number.isFinite(entry[1]) ||
+          (entry.length >= 5 &&
+            !entry.slice(2, 5).every((value) => value === null || Number.isFinite(value))) ||
+          (entry.length === 6 && entry[5] !== "connection-end")
+        ) {
+          throw new Error(`Некоректний запис у блоці історії: ${key}`);
+        }
+        samples.push({
+          timestamp: entry[0],
+          current: entry[1],
+          voltage: entry.length >= 5 ? entry[2] : undefined,
+          power: entry.length >= 5 ? entry[3] : undefined,
+          stateOfCharge: entry.length >= 5 ? entry[4] : undefined,
+          sessionId,
+          kind: entry.length === 6 ? entry[5] : undefined,
+        });
+      }
+    }
+    return samples.sort((first, second) => first.timestamp - second.timestamp);
+  } catch (error) {
+    storageMessages.push(`Не вдалося прочитати історію струму цієї BMS: ${error.message}`);
+    return [];
+  }
+}
+
+function enrichFlowSamples(samples, storedMeasurements) {
+  const timedMeasurements = storedMeasurements
+    .map((measurement) => ({
+      timestamp: Date.parse(measurement.timestamp),
+      voltage: measurement.voltage,
+      power: measurement.power,
+      stateOfCharge: measurement.stateOfCharge,
+    }))
+    .filter((measurement) => Number.isFinite(measurement.timestamp))
+    .sort((first, second) => first.timestamp - second.timestamp);
+
+  if (timedMeasurements.length === 0) return samples;
+
+  return samples.map((sample) => {
+    if (
+      Number.isFinite(sample.voltage) &&
+      Number.isFinite(sample.power) &&
+      Number.isFinite(sample.stateOfCharge)
+    ) {
+      return sample;
+    }
+
+    let low = 0;
+    let high = timedMeasurements.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (timedMeasurements[middle].timestamp < sample.timestamp) low = middle + 1;
+      else high = middle;
+    }
+    const candidates = [timedMeasurements[low - 1], timedMeasurements[low]].filter(Boolean);
+    const nearest = candidates.reduce(
+      (best, measurement) =>
+        !best || Math.abs(measurement.timestamp - sample.timestamp) <
+          Math.abs(best.timestamp - sample.timestamp)
+          ? measurement
+          : best,
+      undefined,
+    );
+    if (!nearest || Math.abs(nearest.timestamp - sample.timestamp) > 10_000) return sample;
+
+    return {
+      ...sample,
+      voltage: Number.isFinite(sample.voltage) ? sample.voltage : nearest.voltage,
+      power: Number.isFinite(sample.power) ? sample.power : nearest.power,
+      stateOfCharge: Number.isFinite(sample.stateOfCharge)
+        ? sample.stateOfCharge
+        : nearest.stateOfCharge,
+    };
+  });
 }
 
 function renderLogSummary() {
@@ -587,6 +1445,58 @@ function renderLogSummary() {
   elements["last-log"].textContent = measurements.length
     ? `Останній запис: ${new Date(measurements.at(-1).timestamp).toLocaleString("uk-UA")}`
     : "Дані ще не записувалися";
+}
+
+function getDeviceStorageId(connectedDevice) {
+  if (typeof connectedDevice.id === "string" && connectedDevice.id.length > 0) {
+    return connectedDevice.id;
+  }
+  if (typeof connectedDevice.name === "string" && connectedDevice.name.length > 0) {
+    return `name:${connectedDevice.name}`;
+  }
+  throw new Error("Bluetooth-пристрій не має сталого ID або назви для окремого збереження даних.");
+}
+
+function makeDeviceStorageKey(baseKey, deviceId) {
+  return `${baseKey}.${encodeURIComponent(deviceId)}`;
+}
+
+function recordRecentDevice(connectedDevice) {
+  if (typeof connectedDevice.id !== "string" || connectedDevice.id.length === 0) return;
+
+  try {
+    const stored = JSON.parse(localStorage.getItem(BLUETOOTH_PREFERENCES_KEY) || "{}");
+    if (!stored || typeof stored !== "object" || Array.isArray(stored)) {
+      throw new Error("Некоректний формат списку Bluetooth-пристроїв.");
+    }
+    const recent = Array.isArray(stored.recent)
+      ? stored.recent.filter((entry) => entry && typeof entry.id === "string")
+      : [];
+    recent.unshift({
+      id: connectedDevice.id,
+      name: connectedDevice.name || "JK BMS",
+      connectedAt: new Date().toISOString(),
+    });
+    const seenIds = new Set();
+    const uniqueRecent = recent
+      .filter((entry) => {
+        if (seenIds.has(entry.id)) return false;
+        seenIds.add(entry.id);
+        return true;
+      })
+      .slice(0, 20);
+    localStorage.setItem(
+      BLUETOOTH_PREFERENCES_KEY,
+      JSON.stringify({
+        favorites: Array.isArray(stored.favorites)
+          ? stored.favorites.filter((id) => typeof id === "string")
+          : [],
+        recent: uniqueRecent,
+      }),
+    );
+  } catch (error) {
+    showNotice(`Не вдалося зберегти останнє підключення: ${error.message}`, "error");
+  }
 }
 
 function setupDashboardLayout() {
@@ -599,6 +1509,8 @@ function setupDashboardLayout() {
     voltage: 1,
     current: 1,
     power: 1,
+    forecast: 2,
+    flow: 2,
     cells: 3,
     status: 1,
     settings: 1,
@@ -610,6 +1522,8 @@ function setupDashboardLayout() {
     voltage: 120,
     current: 120,
     power: 120,
+    forecast: 140,
+    flow: 240,
     cells: 240,
     status: 200,
     settings: 140,
@@ -794,12 +1708,16 @@ function setupDashboardLayout() {
     if (before) {
       target.classList.add("drop-before");
       if (draggedWidget.nextElementSibling !== target) {
+        const firstRects = captureWidgetRects();
         dashboard.insertBefore(draggedWidget, target);
+        animateDashboardLayout(firstRects);
       }
     } else {
       target.classList.add("drop-after");
       if (target.nextElementSibling !== draggedWidget) {
+        const firstRects = captureWidgetRects();
         dashboard.insertBefore(draggedWidget, target.nextElementSibling);
+        animateDashboardLayout(firstRects);
       }
     }
   });
@@ -877,6 +1795,15 @@ function setupDashboardLayout() {
     showNotice(`Не вдалося відновити розташування блоків: ${error.message}`, "error");
   }
   for (const widget of widgets) applyWidgetSize(widget);
+  const contentResizeObserver = new ResizeObserver((entries) => {
+    const changedWidgets = new Set(
+      entries.map((entry) => entry.target.closest("[data-widget]")).filter(Boolean),
+    );
+    for (const widget of changedWidgets) applyWidgetSize(widget);
+  });
+  for (const widget of widgets) {
+    for (const child of widget.children) contentResizeObserver.observe(child);
+  }
   window.addEventListener("resize", () => {
     for (const widget of widgets) applyWidgetSize(widget);
   });
@@ -886,17 +1813,28 @@ function setupDashboardLayout() {
   }
 
   function getGridColumnCount() {
-    return getComputedStyle(dashboard).gridTemplateColumns.split(/\s+/).filter(Boolean).length;
+    const columnCount = Number.parseInt(
+      getComputedStyle(dashboard).getPropertyValue("--dashboard-columns"),
+      10,
+    );
+    return Number.isInteger(columnCount) && columnCount > 0 ? columnCount : 4;
   }
 
   function applyWidgetSize(widget) {
     const size = sizePreferences.get(widget.dataset.widget);
     widget.style.gridColumn = `span ${Math.min(size.columns, getGridColumnCount())}`;
+    widget.style.removeProperty("grid-row-end");
     if (size.minHeight === undefined) {
       widget.style.removeProperty("--widget-min-height");
     } else {
       widget.style.setProperty("--widget-min-height", `${size.minHeight}px`);
     }
+    const gridStyle = getComputedStyle(dashboard);
+    const rowHeight = Number.parseFloat(gridStyle.gridAutoRows);
+    const rowGap = Number.parseFloat(gridStyle.rowGap);
+    const widgetHeight = Math.max(widget.scrollHeight, widget.getBoundingClientRect().height);
+    const rowSpan = Math.max(1, Math.ceil((widgetHeight + rowGap) / (rowHeight + rowGap)));
+    widget.style.gridRowEnd = `span ${rowSpan}`;
   }
 
   function captureWidgetRects() {
@@ -1022,13 +1960,14 @@ function exportCsv() {
 }
 
 function clearLogs() {
-  if (!window.confirm("Видалити всі збережені вимірювання з цього браузера?")) return;
+  if (!measurementStorageKey) return;
+  if (!window.confirm("Видалити вимірювання лише для цієї BMS?")) return;
   try {
-    localStorage.removeItem(LOG_STORAGE_KEY);
+    localStorage.removeItem(measurementStorageKey);
     measurements = [];
     lastSavedAt = Date.parse(latestMeasurement?.timestamp) || 0;
     renderLogSummary();
-    showNotice("Локальний журнал очищено.");
+    showNotice("Журнал вимірювань цієї BMS очищено.");
   } catch (error) {
     showNotice(`Не вдалося очистити журнал: ${error.message}`, "error");
   }
@@ -1041,6 +1980,8 @@ function csvCell(value) {
 }
 
 function handleDisconnect() {
+  recordFlowConnectionEnd();
+  persistFlowChunk();
   if (sampleTimer) window.clearInterval(sampleTimer);
   sampleTimer = undefined;
   writeCharacteristic = undefined;
@@ -1049,6 +1990,7 @@ function handleDisconnect() {
   elements["disconnect-button"].disabled = true;
   elements["refresh-button"].disabled = true;
   elements["settings-button"].disabled = true;
+  renderDischargeForecast({ status: "disconnected" });
   showNotice("З’єднання з BMS завершено.");
 }
 

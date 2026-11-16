@@ -98,6 +98,69 @@
           <div class="metric-value"><span id="power-value">—</span><small>W</small></div>
           <div class="metric-foot">Температура MOS <span id="mos-temperature-value">—</span> °C</div>
         </article>
+        <article class="metric-card metric-runtime dashboard-widget widget-metric" data-widget="forecast">
+          <div class="metric-heading">
+            <span>ПРОГНОЗ РОЗРЯДУ</span>
+            <span class="metric-symbol" aria-hidden="true">◷</span>
+          </div>
+          <div id="discharge-runtime-value" class="metric-value metric-runtime-value">—</div>
+          <div id="discharge-runtime-detail" class="metric-foot">Оцінка з’явиться під час розряду</div>
+        </article>
+        <article class="panel dashboard-widget widget-flow" data-widget="flow">
+          <div class="panel-heading panel-heading-compact">
+            <div>
+              <p class="eyebrow">ЗАРЯДЖАННЯ ТА РОЗРЯДЖАННЯ</p>
+              <h2>Періоди заряду та розряду</h2>
+            </div>
+          </div>
+          <div class="chart-wrap flow-chart-wrap">
+            <svg
+              id="flow-chart"
+              class="voltage-chart flow-chart"
+              viewBox="0 0 800 260"
+              role="img"
+              aria-label="Стовпчиковий графік періодів заряду та розряду батареї"
+            >
+              <text class="chart-empty" x="400" y="126" text-anchor="middle">
+                Періоди заряду й розряду з’являться після вимірювань
+              </text>
+            </svg>
+          </div>
+          <div id="flow-legend" class="chart-legend" aria-label="Легенда періодів заряду та розряду"></div>
+          <div class="flow-events-toolbar">
+            <span id="flow-period-count" class="flow-event-count">Періодів: 0</span>
+            <div class="flow-event-actions">
+              <button id="flow-older-events" class="button button-quiet" type="button" disabled>
+                Старіші
+              </button>
+              <button id="flow-newer-events" class="button button-quiet" type="button" disabled>
+                Новіші
+              </button>
+              <button id="flow-clear-events" class="button button-quiet" type="button" disabled>
+                Очистити історію
+              </button>
+            </div>
+          </div>
+          <p id="flow-table-page" class="flow-table-page">Історія порожня</p>
+          <div class="flow-table-wrap">
+            <table class="flow-table">
+              <thead>
+                <tr>
+                  <th>Початок – кінець</th>
+                  <th>Режим</th>
+                  <th>Активний час</th>
+                  <th>SOC: початок → кінець (Δ)</th>
+                  <th>Енергія, kWh</th>
+                  <th>Середня напруга, V</th>
+                  <th>Струм min–max, A</th>
+                </tr>
+              </thead>
+              <tbody id="flow-event-rows">
+                <tr><td colspan="7" class="flow-table-empty">Періодів ще немає</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
         <article class="panel cells-panel dashboard-widget widget-cells" data-widget="cells">
           <div class="panel-heading">
             <div>
@@ -108,6 +171,46 @@
               <span class="status-dot"></span>
               Розкид <strong id="spread-value">—</strong> mV
             </div>
+          </div>
+          <div class="voltage-chart-toolbar">
+            <div class="chart-mode-toggle" role="group" aria-label="Режим графіка напруги">
+              <button
+                id="chart-mode-overview"
+                class="chart-mode-button is-active"
+                type="button"
+                data-chart-mode="overview"
+                aria-pressed="true"
+              >Огляд</button>
+              <button
+                id="chart-mode-heatmap"
+                class="chart-mode-button"
+                type="button"
+                data-chart-mode="heatmap"
+                aria-pressed="false"
+              >Теплова карта</button>
+              <button
+                id="chart-mode-cell"
+                class="chart-mode-button"
+                type="button"
+                data-chart-mode="cell"
+                aria-pressed="false"
+              >Окрема комірка</button>
+            </div>
+            <label class="chart-select-label">
+              Комірка
+              <select id="cell-chart-select" aria-label="Комірка для детального графіка">
+                <option value="0">Комірка 1</option>
+              </select>
+            </label>
+            <label class="chart-select-label">
+              Період
+              <select id="chart-range" aria-label="Період графіка">
+                <option value="60000">1 хв</option>
+                <option value="300000" selected>5 хв</option>
+                <option value="900000">15 хв</option>
+                <option value="1800000">30 хв</option>
+              </select>
+            </label>
           </div>
           <div class="chart-wrap">
             <svg

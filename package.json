@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "electron .",
-    "test": "node --test protocol.test.mjs",
+    "test": "node --test protocol.test.mjs flow-periods.test.mjs voltage-chart-data.test.mjs discharge-forecast.test.mjs",
     "dist": "electron-builder",
     "dist:mac": "electron-builder --mac dmg",
     "dist:win": "electron-builder --win nsis",
@@ -30,6 +30,9 @@
       "index.html",
       "styles.css",
       "app.mjs",
+      "discharge-forecast.mjs",
+      "flow-periods.mjs",
+      "voltage-chart-data.mjs",
       "protocol.mjs",
       "electron/**/*",
       "README.md"

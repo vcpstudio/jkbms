@@ -161,6 +161,7 @@ export function decodeLiveData(frame, cellCount, protocolVersion = "JK02_24S") {
   const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
   const is32CellLayout = protocolVersion === "JK02_32S";
   const cellOffset = 6;
+  const cellResistanceOffset = is32CellLayout ? 80 : 64;
   const packVoltageOffset = is32CellLayout ? 150 : 118;
   const currentOffset = is32CellLayout ? 158 : 126;
   const temperature1Offset = is32CellLayout ? 162 : 130;
@@ -172,9 +173,11 @@ export function decodeLiveData(frame, cellCount, protocolVersion = "JK02_24S") {
   const cycleCountOffset = is32CellLayout ? 182 : 150;
   const protectionOffset = is32CellLayout ? 166 : 136;
   const cellVoltages = [];
+  const cellResistances = [];
 
   for (let index = 0; index < cellCount; index += 1) {
     cellVoltages.push(view.getUint16(cellOffset + index * 2, true) / 1000);
+    cellResistances.push(view.getUint16(cellResistanceOffset + index * 2, true) / 1000);
   }
 
   const sumVoltage = cellVoltages.reduce((sum, value) => sum + value, 0);
@@ -191,6 +194,7 @@ export function decodeLiveData(frame, cellCount, protocolVersion = "JK02_24S") {
   return {
     timestamp: new Date().toISOString(),
     cellVoltages,
+    cellResistances,
     voltage,
     current,
     power: voltage * current,
