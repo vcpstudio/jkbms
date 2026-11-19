@@ -1,7 +1,13 @@
 export const FLOW_IDLE_GAP_MS = 5 * 60 * 1000;
 export const FLOW_CURRENT_DEADBAND_A = 0.1;
 
-export function buildFlowPeriods(samples, now = Date.now(), idleGapMs = FLOW_IDLE_GAP_MS) {
+export function buildFlowPeriods(
+  samples,
+  now = Date.now(),
+  idleGapMs = FLOW_IDLE_GAP_MS,
+  options = {},
+) {
+  const { activeSessionId } = options;
   const groupedSamples = new Map();
   for (const sample of samples) {
     if (!Number.isFinite(sample.timestamp) || !Number.isFinite(sample.current)) continue;
@@ -16,7 +22,11 @@ export function buildFlowPeriods(samples, now = Date.now(), idleGapMs = FLOW_IDL
   const periods = [];
 
   sessions.forEach((sessionSamples, sessionIndex) => {
-    const isLatestSession = sessionIndex === sessions.length - 1;
+    const sessionId = sessionSamples[0].sessionId ?? "legacy";
+    const isActiveSession =
+      activeSessionId !== undefined
+        ? sessionId === activeSessionId
+        : sessionIndex === sessions.length - 1;
     let period;
     let previousSample;
     let idleSince;
@@ -125,7 +135,11 @@ export function buildFlowPeriods(samples, now = Date.now(), idleGapMs = FLOW_IDL
           begin(
             sample,
             direction,
-            Boolean(previousSample && directionOf(previousSample.current) === null),
+            Boolean(
+              previousSample &&
+                previousSample.kind !== "connection-end" &&
+                directionOf(previousSample.current) === null,
+            ),
           );
         }
         previousSample = sample;
@@ -133,9 +147,11 @@ export function buildFlowPeriods(samples, now = Date.now(), idleGapMs = FLOW_IDL
       }
 
       if (direction === null) {
-        integrateInterval(previousSample, sample);
-        addSample(sample);
-        if (idleSince === undefined) idleSince = sample.timestamp;
+        if (idleSince === undefined) {
+          integrateInterval(previousSample, sample);
+          addSample(sample);
+          idleSince = sample.timestamp;
+        }
         previousSample = sample;
         continue;
       }
@@ -168,12 +184,12 @@ export function buildFlowPeriods(samples, now = Date.now(), idleGapMs = FLOW_IDL
 
     if (period) {
       if (idleSince !== undefined) {
-        if (!isLatestSession || now - idleSince > idleGapMs) {
+        if (!isActiveSession || now - idleSince > idleGapMs) {
           finish(idleSince, "complete", true);
         } else {
           finish(idleSince, "paused", false);
         }
-      } else if (isLatestSession) {
+      } else if (isActiveSession) {
         finish(previousSample.timestamp, "active", false);
       } else {
         finish(previousSample.timestamp, "interrupted", false);

@@ -1,3 +1,5 @@
+import { resolveRecentDevices } from "../app-utils.mjs";
+
 const deviceList = document.getElementById("device-list");
 const deviceStatus = document.getElementById("device-status");
 const cancelButton = document.getElementById("cancel-button");
@@ -22,10 +24,7 @@ function renderDevices() {
   const visibleDevices = devices.filter((device) =>
     `${device.deviceName || ""} ${device.deviceId}`.toLocaleLowerCase().includes(query),
   );
-  const devicesById = new Map(visibleDevices.map((device) => [device.deviceId, device]));
-  const recentDevices = preferences.recent
-    .map(({ id }) => devicesById.get(id))
-    .filter(Boolean);
+  const recentDevices = resolveRecentDevices(preferences.recent, visibleDevices);
   const recentIds = new Set(recentDevices.map(({ deviceId }) => deviceId));
   const favoriteDevices = visibleDevices.filter(
     ({ deviceId }) => preferences.favorites.includes(deviceId) && !recentIds.has(deviceId),

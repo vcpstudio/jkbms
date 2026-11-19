@@ -10,10 +10,18 @@ import {
 } from "./protocol.mjs";
 import {
   DISCHARGE_FORECAST_WINDOW_MS,
+  estimateChargeRuntime,
   estimateDischargeRuntime,
 } from "./discharge-forecast.mjs";
-import { buildFlowPeriods } from "./flow-periods.mjs";
+import { FLOW_IDLE_GAP_MS, buildFlowPeriods } from "./flow-periods.mjs";
 import { aggregateCellVoltageSamples } from "./voltage-chart-data.mjs";
+import {
+  formatCsvCell,
+  minMaxValues,
+  parseFlowChunkEntries,
+  selectChunksToEvict,
+  shouldRecordFlowSample,
+} from "./app-utils.mjs";
 
 const LOG_STORAGE_KEY = "jk-bms-monitor.measurements.v1";
 const FLOW_STORAGE_KEY = "jk-bms-monitor.flow-events.v1";
@@ -21,6 +29,8 @@ const BLUETOOTH_PREFERENCES_KEY = "jk-bms-monitor.bluetooth-preferences.v1";
 const DASHBOARD_LAYOUT_KEY = "jk-bms-monitor.dashboard-layout.v1";
 const MAX_SAMPLES = 2000;
 const MAX_FLOW_CHUNK_SAMPLES = 500;
+const MAX_FLOW_CHUNKS = 20;
+const MAX_FLOW_SAMPLES = MAX_FLOW_CHUNKS * MAX_FLOW_CHUNK_SAMPLES;
 const FLOW_TABLE_PAGE_SIZE = 100;
 const SAMPLE_INTERVAL_MS = 5000;
 const CHART_SAMPLE_INTERVAL_MS = 1000;
@@ -33,24 +43,21 @@ const elements = Object.fromEntries(
     "connection-indicator",
     "connection-state",
     "app-update-button",
-    "app-update-banner",
-    "app-update-message",
-    "app-update-action",
     "dashboard-grid",
     "layout-toggle",
     "layout-reset",
-    "layout-hint",
     "connect-button",
     "disconnect-button",
     "refresh-button",
-    "settings-button",
     "device-summary",
-    "notice",
+    "toast-container",
     "soc-value",
     "soc-bar",
     "capacity-value",
     "discharge-runtime-value",
     "discharge-runtime-detail",
+    "charge-runtime-value",
+    "charge-runtime-detail",
     "voltage-value",
     "average-cell-value",
     "current-value",
@@ -95,6 +102,7 @@ const elements = Object.fromEntries(
 
 let device;
 let gattServer;
+let notifyCharacteristic;
 let writeCharacteristic;
 let commandCounter = 0;
 let settings;
@@ -112,6 +120,7 @@ let flowSessionId;
 let flowStoragePrefix;
 let flowChunkIndex = 0;
 let flowChunkSamples = [];
+let flowChunkDirty = false;
 let flowTablePage = 0;
 let flowStorageWarningShown = false;
 let lastFlowSampleAt;
@@ -120,23 +129,25 @@ let lastChartSampleAt = 0;
 let assembler = new FrameAssembler();
 let measurements = [];
 let measurementStorageKey;
+let measurementStorageWarningShown = false;
 let legacyLogNoticeShown = false;
-let storageMessages = [];
+let storageWarnings = [];
+let storageErrors = [];
 let lastSavedAt = 0;
 let sampleTimer;
-let noticeTimer;
+const activeToasts = new Map();
 
 renderLogSummary();
 setupDashboardLayout();
 renderVoltageChart();
 refreshFlowPeriods();
 new ResizeObserver(() => renderVoltageChart()).observe(elements["voltage-chart"]);
-new ResizeObserver(() => renderFlowChart()).observe(elements["flow-chart"]);
+new ResizeObserver(() => renderFlowChart()).observe(elements["flow-chart"].parentElement);
+setupIconTooltips();
 
 elements["connect-button"].addEventListener("click", connect);
 elements["disconnect-button"].addEventListener("click", disconnect);
 elements["refresh-button"].addEventListener("click", requestData);
-elements["settings-button"].addEventListener("click", requestData);
 for (const button of [
   elements["chart-mode-overview"],
   elements["chart-mode-heatmap"],
@@ -170,8 +181,56 @@ if (!("bluetooth" in navigator)) {
   showNotice(
     "Цей браузер не підтримує Web Bluetooth. Відкрий застосунок у Chrome або Edge на комп’ютері через localhost чи HTTPS.",
     "error",
+    { persistent: true },
   );
   elements["connect-button"].disabled = true;
+}
+
+function setupIconTooltips() {
+  const tooltip = document.createElement("div");
+  tooltip.className = "icon-tooltip";
+  tooltip.setAttribute("role", "tooltip");
+  tooltip.hidden = true;
+  document.body.append(tooltip);
+
+  let activeButton;
+  const show = (button) => {
+    const text = button.dataset.tooltip;
+    if (!text || button.hidden || button.disabled) return;
+    activeButton = button;
+    tooltip.textContent = text;
+    tooltip.hidden = false;
+    const rect = button.getBoundingClientRect();
+    const tooltipRect = tooltip.getBoundingClientRect();
+    const margin = 8;
+    let left = rect.left + rect.width / 2 - tooltipRect.width / 2;
+    left = Math.max(margin, Math.min(left, window.innerWidth - tooltipRect.width - margin));
+    let top = rect.bottom + 8;
+    if (top + tooltipRect.height + margin > window.innerHeight) {
+      top = rect.top - tooltipRect.height - 8;
+    }
+    tooltip.style.left = `${left}px`;
+    tooltip.style.top = `${Math.max(margin, top)}px`;
+  };
+  const hide = (button) => {
+    if (!button || button === activeButton) {
+      tooltip.hidden = true;
+      activeButton = undefined;
+    }
+  };
+  for (const button of document.querySelectorAll("[data-tooltip]")) {
+    button.addEventListener("mouseenter", () => show(button));
+    button.addEventListener("mouseleave", () => hide(button));
+    button.addEventListener("focus", () => show(button));
+    button.addEventListener("blur", () => hide(button));
+    button.addEventListener("pointerdown", () => hide(button));
+    button.addEventListener("click", () => hide(button));
+  }
+  window.addEventListener("scroll", () => hide(), { passive: true });
+  window.addEventListener("resize", () => hide());
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") hide();
+  });
 }
 
 function setupDesktopUpdates() {
@@ -180,8 +239,16 @@ function setupDesktopUpdates() {
   if (!desktop) return;
 
   checkButton.hidden = false;
-  let action;
-  let bannerTimer;
+
+  const runUpdateAction = async (actionName) => {
+    try {
+      if (actionName === "download") await desktop.downloadUpdate();
+      else if (actionName === "install") await desktop.installUpdate();
+      else if (actionName === "release") await desktop.openReleasePage();
+    } catch (error) {
+      renderUpdateStatus({ state: "error", message: error.message });
+    }
+  };
 
   desktop.onUpdateStatus(renderUpdateStatus);
   checkButton.addEventListener("click", async () => {
@@ -191,100 +258,137 @@ function setupDesktopUpdates() {
       renderUpdateStatus({ state: "error", message: error.message });
     }
   });
-  elements["app-update-action"].addEventListener("click", async () => {
-    try {
-      if (action === "download") await desktop.downloadUpdate();
-      else if (action === "install") await desktop.installUpdate();
-      else if (action === "release") await desktop.openReleasePage();
-    } catch (error) {
-      renderUpdateStatus({ state: "error", message: error.message });
-    }
-  });
 
   function renderUpdateStatus(status) {
-    window.clearTimeout(bannerTimer);
-    action = undefined;
-    elements["app-update-action"].hidden = true;
     checkButton.disabled = ["checking", "downloading", "downloaded"].includes(status.state);
-    elements["app-update-banner"].dataset.kind = status.state === "error" ? "error" : "info";
+    checkButton.hidden = !["idle", "current", "error"].includes(status.state);
 
     switch (status.state) {
       case "idle":
-        elements["app-update-banner"].hidden = true;
+        dismissNotice("app-update");
         return;
       case "checking":
-        setUpdateMessage("Перевіряю, чи є нові версії…");
+        showNotice("Перевіряю, чи є нові версії…", "info", {
+          key: "app-update",
+          persistent: true,
+          dismissible: false,
+        });
         return;
       case "available":
-        setUpdateMessage(`Доступна версія ${status.version}. Завантажити оновлення?`);
-        setUpdateAction("Завантажити", "download");
+        showNotice(`Доступна версія ${status.version}. Завантажити оновлення?`, "info", {
+          key: "app-update",
+          persistent: true,
+          action: { label: "Завантажити", onClick: () => runUpdateAction("download") },
+          onDismiss: () => {
+            checkButton.hidden = false;
+          },
+        });
         return;
       case "manual":
-        setUpdateMessage(
+        showNotice(
           `Доступна версія ${status.version}. Для цієї непідписаної збірки macOS встанови новий DMG вручну.`,
+          "info",
+          {
+            key: "app-update",
+            persistent: true,
+            action: { label: "Відкрити реліз", onClick: () => runUpdateAction("release") },
+            onDismiss: () => {
+              checkButton.hidden = false;
+            },
+          },
         );
-        setUpdateAction("Відкрити реліз", "release");
         return;
       case "downloading":
-        setUpdateMessage(`Завантажую оновлення: ${Math.round(status.percent)}%`);
+        showNotice(`Завантажую оновлення: ${Math.round(status.percent)}%`, "info", {
+          key: "app-update",
+          persistent: true,
+          dismissible: false,
+        });
         return;
       case "downloaded":
-        setUpdateMessage(`Версію ${status.version} завантажено. Перезапусти застосунок для встановлення.`);
-        setUpdateAction("Перезапустити", "install");
+        showNotice(
+          `Версію ${status.version} завантажено. Перезапусти застосунок для встановлення.`,
+          "info",
+          {
+            key: "app-update",
+            persistent: true,
+            action: { label: "Перезапустити", onClick: () => runUpdateAction("install") },
+          },
+        );
         return;
       case "current":
-        setUpdateMessage(`Встановлено останню версію (${status.version}).`);
-        bannerTimer = window.setTimeout(() => {
-          elements["app-update-banner"].hidden = true;
-        }, 6000);
+        showNotice(`Встановлено останню версію (${status.version}).`, "info", {
+          key: "app-update",
+          duration: 6000,
+        });
         return;
       case "error":
-        setUpdateMessage(`Не вдалося перевірити або завантажити оновлення: ${status.message}`);
+        showNotice(
+          `Не вдалося перевірити або завантажити оновлення: ${status.message}`,
+          "error",
+          { key: "app-update" },
+        );
         return;
       default:
         console.error("Отримано невідомий стан оновлення:", status);
-        elements["app-update-banner"].hidden = true;
+        dismissNotice("app-update");
     }
-  }
-
-  function setUpdateMessage(message) {
-    elements["app-update-message"].textContent = message;
-    elements["app-update-banner"].hidden = false;
-  }
-
-  function setUpdateAction(label, actionName) {
-    const button = elements["app-update-action"];
-    button.textContent = label;
-    button.hidden = false;
-    action = actionName;
   }
 }
 
 async function connect() {
   elements["connect-button"].disabled = true;
+  elements["connect-button"].hidden = true;
+  elements["disconnect-button"].hidden = true;
+  elements["refresh-button"].hidden = true;
   showNotice("Вибери свою BMS у системному вікні Bluetooth.");
 
+  let connectedDevice;
   try {
-    device = await navigator.bluetooth.requestDevice({
+    connectedDevice = await navigator.bluetooth.requestDevice({
       acceptAllDevices: true,
       optionalServices: [SERVICE_UUID],
     });
+    const selectedDesktopDevice =
+      await window.jkbmsDesktop?.consumeSelectedBluetoothDevice?.().catch(() => null);
+
+    if (sampleTimer) {
+      window.clearInterval(sampleTimer);
+      sampleTimer = undefined;
+    }
+    if (notifyCharacteristic) {
+      notifyCharacteristic.removeEventListener("characteristicvaluechanged", handleNotification);
+      notifyCharacteristic = undefined;
+    }
+    if (device && device !== connectedDevice) {
+      device.removeEventListener("gattserverdisconnected", handleDisconnect);
+    }
+    device = connectedDevice;
+
     const storageId = getDeviceStorageId(device);
     const usesNameFallback = !device.id;
-    storageMessages = [];
+    storageWarnings = [];
+    storageErrors = [];
     measurementStorageKey = makeDeviceStorageKey(LOG_STORAGE_KEY, storageId);
     flowStoragePrefix = makeDeviceStorageKey(FLOW_STORAGE_KEY, storageId) + ".";
     measurements = loadMeasurements(measurementStorageKey);
-    flowSamples = enrichFlowSamples(loadFlowSamples(flowStoragePrefix), measurements);
-    flowPeriods = buildFlowPeriods(flowSamples);
+    flowSamples = enrichFlowSamples(loadFlowSamples(flowStoragePrefix), measurements).slice(
+      -MAX_FLOW_SAMPLES,
+    );
     flowSessionId = crypto.randomUUID();
+    flowPeriods = buildFlowPeriods(flowSamples, Date.now(), FLOW_IDLE_GAP_MS, {
+      activeSessionId: null,
+    });
     flowChunkIndex = 0;
     flowChunkSamples = [];
+    flowChunkDirty = false;
     flowTablePage = 0;
     flowStorageWarningShown = false;
+    measurementStorageWarningShown = false;
     lastFlowSampleAt = undefined;
     flowSessionClosed = false;
     lastFlowCurrent = undefined;
+    selectedCellIndex = 0;
     renderLogSummary();
     renderFlowTable();
     settings = undefined;
@@ -302,7 +406,7 @@ async function connect() {
     gattServer = await device.gatt.connect();
     const service = await gattServer.getPrimaryService(SERVICE_UUID);
     const characteristics = await service.getCharacteristics(CHARACTERISTIC_UUID);
-    const notifyCharacteristic = characteristics.find(
+    const foundNotifyCharacteristic = characteristics.find(
       (characteristic) => characteristic.properties.notify || characteristic.properties.indicate,
     );
     writeCharacteristic = characteristics.find(
@@ -310,44 +414,66 @@ async function connect() {
         characteristic.properties.write || characteristic.properties.writeWithoutResponse,
     );
 
-    if (!notifyCharacteristic || !writeCharacteristic) {
+    if (!foundNotifyCharacteristic || !writeCharacteristic) {
       throw new Error("У службі JK BMS не знайдено потрібні BLE-характеристики.");
     }
 
     assembler = new FrameAssembler();
+    notifyCharacteristic = foundNotifyCharacteristic;
     notifyCharacteristic.addEventListener("characteristicvaluechanged", handleNotification);
     await notifyCharacteristic.startNotifications();
     setConnectionState("Підключено", true);
     elements["device-summary"].textContent = device.name || "JK BMS через Bluetooth LE";
+    elements["connect-button"].hidden = true;
     elements["disconnect-button"].disabled = false;
+    elements["disconnect-button"].hidden = false;
     elements["refresh-button"].disabled = false;
-    elements["settings-button"].disabled = false;
+    elements["refresh-button"].hidden = false;
     showNotice("З’єднання встановлено. Зчитую статус і налаштування.");
     await requestData();
-    const connectionMessages = [...storageMessages];
+    if (!gattServer?.connected || !writeCharacteristic) {
+      return;
+    }
+
+    const warnings = [...storageWarnings];
     if (usesNameFallback) {
-      connectionMessages.push(
-        "Bluetooth не надав сталий ID; дані цієї BMS зберігаються за її назвою.",
-      );
+      warnings.push("Bluetooth не надав сталий ID; дані цієї BMS зберігаються за її назвою.");
     }
-    if (connectionMessages.length > 0) {
-      showNotice(connectionMessages.join(" "), storageMessages.length > 0 ? "error" : "warning");
+    if (storageErrors.length > 0) {
+      showNotice(storageErrors.join(" "), "error");
     }
-    recordRecentDevice(device);
+    if (warnings.length > 0) {
+      showNotice(warnings.join(" "), "warning");
+    }
+    recordRecentDevice(device, selectedDesktopDevice);
+    if (sampleTimer) window.clearInterval(sampleTimer);
     sampleTimer = window.setInterval(() => {
       if (latestMeasurement) recordFlowSample(latestMeasurement);
       saveCurrentMeasurement();
-      persistFlowChunk();
+      if (flowChunkDirty) persistFlowChunk();
       refreshFlowPeriods();
     }, SAMPLE_INTERVAL_MS);
   } catch (error) {
     elements["connect-button"].disabled = false;
+    elements["connect-button"].hidden = false;
+    elements["disconnect-button"].disabled = true;
+    elements["disconnect-button"].hidden = true;
+    elements["refresh-button"].disabled = true;
+    elements["refresh-button"].hidden = true;
     if (error.name === "NotFoundError") {
-      clearNotice();
       return;
     }
-    if (device?.gatt?.connected) device.gatt.disconnect();
-    const storageMessage = storageMessages.length ? ` ${storageMessages.join(" ")}` : "";
+    if (notifyCharacteristic) {
+      notifyCharacteristic.removeEventListener("characteristicvaluechanged", handleNotification);
+      notifyCharacteristic = undefined;
+    }
+    writeCharacteristic = undefined;
+    if (connectedDevice) {
+      connectedDevice.removeEventListener("gattserverdisconnected", handleDisconnect);
+      if (connectedDevice.gatt?.connected) connectedDevice.gatt.disconnect();
+    }
+    const extraMessages = [...storageErrors, ...storageWarnings];
+    const storageMessage = extraMessages.length ? ` ${extraMessages.join(" ")}` : "";
     showNotice(`Не вдалося підключитися: ${error.message}${storageMessage}`, "error");
     setConnectionState("Не підключено", false);
   }
@@ -399,8 +525,12 @@ function handleFrame(frame) {
   switch (frame[4]) {
     case 0x01:
       settings = decodeSettings(frame);
-      renderSettings();
-      elements["settings-button"].textContent = "Оновити дані й статус";
+      elements["settings-cell-count"].textContent = String(settings.cellCount);
+      elements["cell-count-label"].textContent = `(${settings.cellCount})`;
+      updateCellSelector(settings.cellCount);
+      elements["charging-value"].textContent = settings.chargingEnabled ? "Увімкнено" : "Вимкнено";
+      elements["discharging-value"].textContent = settings.dischargingEnabled ? "Увімкнено" : "Вимкнено";
+      elements["balancing-value"].textContent = settings.balancingEnabled ? "Увімкнено" : "Вимкнено";
       if (latestMeasurement) {
         renderMeasurement(latestMeasurement);
       }
@@ -409,14 +539,18 @@ function handleFrame(frame) {
     case 0x02:
       if (!settings || !protocolVersion) {
         pendingLiveFrame = frame;
-        showNotice("Отримано дані комірок; визначаю профіль протоколу BMS.");
+        showNotice("Отримано дані комірок; визначаю профіль протоколу BMS.", "info", {
+          key: "protocol-detect",
+        });
         return;
       }
       renderLiveData(frame);
       break;
     case 0x03: {
       const info = decodeDeviceInfo(frame);
-      protocolVersion = detectProtocolVersion(info, device?.name || "");
+      if (!protocolVersion) {
+        protocolVersion = detectProtocolVersion(info, device?.name || "");
+      }
       if (info.model) {
         elements["model-value"].textContent = info.model;
         elements["device-summary"].textContent = `${info.model}${
@@ -438,23 +572,13 @@ function renderPendingLiveData() {
 }
 
 function renderLiveData(frame) {
+  dismissNotice("protocol-detect");
   latestMeasurement = decodeLiveData(frame, settings.cellCount, protocolVersion);
   recordDischargeSample(latestMeasurement);
   renderMeasurement(latestMeasurement);
   recordChartSample(latestMeasurement);
   recordFlowSample(latestMeasurement);
   saveCurrentMeasurement();
-}
-
-function renderSettings() {
-  elements["settings-cell-count"].textContent = String(settings.cellCount);
-  elements["cell-count-label"].textContent = `(${settings.cellCount})`;
-  updateCellSelector(settings.cellCount);
-  elements["charging-value"].textContent = settings.chargingEnabled ? "Увімкнено" : "Вимкнено";
-  elements["discharging-value"].textContent = settings.dischargingEnabled
-    ? "Увімкнено"
-    : "Вимкнено";
-  elements["balancing-value"].textContent = settings.balancingEnabled ? "Увімкнено" : "Вимкнено";
 }
 
 function renderMeasurement(measurement) {
@@ -473,6 +597,7 @@ function renderMeasurement(measurement) {
   elements["cycles-value"].textContent = String(measurement.cycleCount);
   elements["last-update"].textContent = new Date(measurement.timestamp).toLocaleTimeString("uk-UA");
   renderDischargeForecast(estimateDischargeRuntime(dischargeSamples));
+  renderChargeForecast(estimateChargeRuntime(dischargeSamples));
   renderCells(measurement.cellVoltages, measurement.cellResistances);
   renderProtection(measurement.protectionAlerts, measurement.unknownProtectionMask);
 }
@@ -498,11 +623,14 @@ function resetTelemetry() {
     "cycles-value",
     "discharge-runtime-value",
     "discharge-runtime-detail",
+    "charge-runtime-value",
+    "charge-runtime-detail",
   ]) {
     elements[id].textContent = "—";
   }
   dischargeSamples = [];
   renderDischargeForecast({ status: "unavailable" });
+  renderChargeForecast({ status: "unavailable" });
   elements["protection-status"].textContent = "Очікування телеметрії BMS";
   elements["protection-status"].dataset.state = "unknown";
   elements["protection-list"].replaceChildren();
@@ -511,7 +639,6 @@ function resetTelemetry() {
   elements["model-value"].textContent = "Не визначена";
   elements["cells-grid"].innerHTML = '<p class="empty-state">Дані комірок з’являться після підключення.</p>';
   elements["last-update"].textContent = "Очікування даних";
-  elements["settings-button"].textContent = "Налаштування доступні після з’єднання";
   renderVoltageChart([]);
   renderFlowChart();
   elements["chart-legend"].replaceChildren();
@@ -622,11 +749,19 @@ function recordChartSample(measurement) {
 
 function recordDischargeSample(measurement) {
   const timestamp = Date.parse(measurement.timestamp);
+  const fullCapacity =
+    Number.isFinite(measurement.nominalCapacity) && measurement.nominalCapacity > 0
+      ? measurement.nominalCapacity
+      : measurement.stateOfCharge > 0
+        ? measurement.remainingCapacity / (measurement.stateOfCharge / 100)
+        : undefined;
   dischargeSamples.push({
     timestamp,
     current: measurement.current,
     power: measurement.power,
     remainingCapacity: measurement.remainingCapacity,
+    stateOfCharge: measurement.stateOfCharge,
+    fullCapacity,
   });
   const oldestAllowed = timestamp - DISCHARGE_FORECAST_WINDOW_MS;
   dischargeSamples = dischargeSamples
@@ -673,6 +808,45 @@ function renderDischargeForecast(forecast) {
             : "Оцінка з’явиться під час розряду";
 }
 
+function renderChargeForecast(forecast) {
+  const value = elements["charge-runtime-value"];
+  const detail = elements["charge-runtime-detail"];
+  const card = value.closest(".metric-card");
+  card.dataset.state = forecast.status;
+
+  if (forecast.status === "charging") {
+    value.textContent = formatDischargeDuration(forecast.runtimeHours);
+    const chargingPower = Number.isFinite(forecast.averagePower)
+      ? forecast.averagePower >= 1000
+        ? `${(forecast.averagePower / 1000).toFixed(1)} kW`
+        : `${forecast.averagePower.toFixed(0)} W`
+      : "";
+    const source = forecast.method === "average" ? "Середнє" : "Поточне";
+    detail.textContent =
+      `${source}: ${forecast.averageCurrent.toFixed(1)} A` +
+      (chargingPower ? ` · ${chargingPower}` : "");
+    detail.title =
+      `Оцінка за ${forecast.method === "average" ? "середнім" : "поточним"} струмом заряджання` +
+      (forecast.method === "average" ? " за доступний період до 5 хв" : "") +
+      ` ${forecast.averageCurrent.toFixed(2)} A; до повного заряду ` +
+      `${forecast.remainingCapacity.toFixed(2)} Ah при SOC ${forecast.stateOfCharge}%.`;
+    return;
+  }
+
+  value.textContent = "—";
+  detail.removeAttribute("title");
+  detail.textContent =
+    forecast.status === "full"
+      ? "Акумулятор повністю заряджений"
+      : forecast.status === "discharging"
+        ? "Розряджається — прогноз заряду неактивний"
+        : forecast.status === "idle"
+          ? "Немає зарядного струму"
+          : forecast.status === "disconnected"
+            ? "Немає активного з’єднання"
+            : "Оцінка з’явиться під час заряджання";
+}
+
 function formatDischargeDuration(runtimeHours) {
   const totalMinutes = Math.round(runtimeHours * 60);
   if (totalMinutes < 1) return "<1 хв";
@@ -688,15 +862,20 @@ function formatDischargeDuration(runtimeHours) {
 function recordFlowSample(measurement) {
   const timestamp = Date.parse(measurement.timestamp);
   const current = measurement.current;
-  const previousCurrent = lastFlowCurrent;
-  const currentChanged = current !== previousCurrent;
-  const sampleDue =
-    current !== 0 &&
-    (lastFlowSampleAt === undefined || timestamp - lastFlowSampleAt >= SAMPLE_INTERVAL_MS);
+  if (
+    flowSessionClosed ||
+    !shouldRecordFlowSample({
+      current,
+      previousCurrent: lastFlowCurrent,
+      timestamp,
+      lastSampleAt: lastFlowSampleAt,
+      sampleIntervalMs: SAMPLE_INTERVAL_MS,
+    })
+  ) {
+    return;
+  }
+
   lastFlowCurrent = current;
-
-  if (flowSessionClosed || (!currentChanged && !sampleDue)) return;
-
   const sample = {
     timestamp,
     current,
@@ -706,6 +885,9 @@ function recordFlowSample(measurement) {
     sessionId: flowSessionId,
   };
   flowSamples.push(sample);
+  if (flowSamples.length > MAX_FLOW_SAMPLES) {
+    flowSamples = flowSamples.slice(-MAX_FLOW_SAMPLES);
+  }
   flowChunkSamples.push([
     timestamp,
     current,
@@ -713,15 +895,21 @@ function recordFlowSample(measurement) {
     measurement.power,
     measurement.stateOfCharge,
   ]);
+  flowChunkDirty = true;
   lastFlowSampleAt = timestamp;
-  persistFlowChunk();
-  flowTablePage = 0;
+  if (flowChunkSamples.length >= MAX_FLOW_CHUNK_SAMPLES) {
+    persistFlowChunk();
+  }
 }
 
 function recordFlowConnectionEnd() {
   if (flowSessionClosed || !flowStoragePrefix || !flowSessionId || !latestMeasurement) return;
 
-  const timestamp = Math.max(Date.now(), Date.parse(latestMeasurement.timestamp));
+  const lastMeasurementAt = Date.parse(latestMeasurement.timestamp);
+  const timestamp = Math.max(
+    lastMeasurementAt,
+    Math.min(Date.now(), lastMeasurementAt + SAMPLE_INTERVAL_MS),
+  );
   const sample = {
     timestamp,
     current: latestMeasurement.current,
@@ -732,6 +920,9 @@ function recordFlowConnectionEnd() {
     kind: "connection-end",
   };
   flowSamples.push(sample);
+  if (flowSamples.length > MAX_FLOW_SAMPLES) {
+    flowSamples = flowSamples.slice(-MAX_FLOW_SAMPLES);
+  }
   flowChunkSamples.push([
     timestamp,
     sample.current,
@@ -740,23 +931,75 @@ function recordFlowConnectionEnd() {
     sample.stateOfCharge,
     sample.kind,
   ]);
+  flowChunkDirty = true;
   flowSessionClosed = true;
   persistFlowChunk();
   refreshFlowPeriods();
 }
 
+function getStoredFlowChunkSummaries(storagePrefix) {
+  const summaries = [];
+  for (let index = 0; index < localStorage.length; index += 1) {
+    const key = localStorage.key(index);
+    if (!key?.startsWith(storagePrefix)) continue;
+    let oldestTimestamp = 0;
+    try {
+      const chunk = JSON.parse(localStorage.getItem(key) || "[]");
+      if (Array.isArray(chunk) && Array.isArray(chunk[0]) && Number.isFinite(chunk[0][0])) {
+        oldestTimestamp = chunk[0][0];
+      }
+    } catch {
+      oldestTimestamp = 0;
+    }
+    summaries.push({ key, oldestTimestamp });
+  }
+  return summaries;
+}
+
+function evictExcessFlowChunks(storagePrefix, maxChunks, protectedKey) {
+  const summaries = getStoredFlowChunkSummaries(storagePrefix);
+  const keysToRemove = selectChunksToEvict(summaries, maxChunks, protectedKey);
+  for (const key of keysToRemove) {
+    localStorage.removeItem(key);
+  }
+  return keysToRemove.length;
+}
+
 function persistFlowChunk() {
-  if (!flowStoragePrefix || flowChunkSamples.length === 0) return;
+  if (!flowStoragePrefix || !flowChunkDirty || flowChunkSamples.length === 0) return;
 
   const chunkKey = `${flowStoragePrefix}${flowSessionId}.${flowChunkIndex}`;
+  const serialized = JSON.stringify(flowChunkSamples);
   try {
-    localStorage.setItem(chunkKey, JSON.stringify(flowChunkSamples));
+    localStorage.setItem(chunkKey, serialized);
+    evictExcessFlowChunks(flowStoragePrefix, MAX_FLOW_CHUNKS, chunkKey);
+    flowChunkDirty = false;
     flowStorageWarningShown = false;
     if (flowChunkSamples.length >= MAX_FLOW_CHUNK_SAMPLES) {
       flowChunkIndex += 1;
       flowChunkSamples = [];
     }
   } catch (error) {
+    const summaries = getStoredFlowChunkSummaries(flowStoragePrefix);
+    const evicted = evictExcessFlowChunks(
+      flowStoragePrefix,
+      Math.max(1, summaries.length - 2),
+      chunkKey,
+    );
+    if (evicted > 0) {
+      try {
+        localStorage.setItem(chunkKey, serialized);
+        flowChunkDirty = false;
+        flowStorageWarningShown = false;
+        if (flowChunkSamples.length >= MAX_FLOW_CHUNK_SAMPLES) {
+          flowChunkIndex += 1;
+          flowChunkSamples = [];
+        }
+        return;
+      } catch {
+        // Fall through to report storage error once.
+      }
+    }
     if (!flowStorageWarningShown) {
       showNotice(`Не вдалося зберегти події струму для цієї BMS: ${error.message}`, "error");
       flowStorageWarningShown = true;
@@ -765,7 +1008,9 @@ function persistFlowChunk() {
 }
 
 function refreshFlowPeriods() {
-  flowPeriods = buildFlowPeriods(flowSamples);
+  flowPeriods = buildFlowPeriods(flowSamples, Date.now(), FLOW_IDLE_GAP_MS, {
+    activeSessionId: device?.gatt?.connected ? flowSessionId : null,
+  });
   renderFlowTable();
   renderFlowChart();
 }
@@ -879,6 +1124,7 @@ function clearFlowEvents() {
     for (const key of keys) localStorage.removeItem(key);
     flowSamples = [];
     flowChunkSamples = [];
+    flowChunkDirty = false;
     flowChunkIndex = 0;
     lastFlowCurrent = undefined;
     lastFlowSampleAt = undefined;
@@ -911,17 +1157,22 @@ function renderVoltageChart() {
   }
 
   const bounds = { left: 72, right: chartWidth - 18, top: 20, bottom: 204 };
+  if (bounds.right <= bounds.left) return;
   const rangeMs = Number(elements["chart-range"].value);
   const lastTimestamp = chartSamples.at(-1).timestamp;
   const firstTimestamp = lastTimestamp - rangeMs;
   const visibleSamples = chartSamples.filter((sample) => sample.timestamp >= firstTimestamp);
-  const cellCount = Math.max(...visibleSamples.map((sample) => sample.cellVoltages.length));
+  const cellCount = visibleSamples.reduce(
+    (maximum, sample) => Math.max(maximum, sample.cellVoltages.length),
+    0,
+  );
   const selectedVoltages =
     chartMode === "cell"
       ? visibleSamples.map((sample) => sample.cellVoltages[selectedCellIndex])
       : visibleSamples.flatMap((sample) => sample.cellVoltages);
   const voltages = selectedVoltages.filter((value) => Number.isFinite(value) && value > 0);
-  if (voltages.length === 0) {
+  const range = minMaxValues(voltages);
+  if (!range || cellCount === 0) {
     const empty = svgElement("text", {
       class: "chart-empty",
       x: chartWidth / 2,
@@ -933,8 +1184,8 @@ function renderVoltageChart() {
     return;
   }
 
-  const dataMin = Math.min(...voltages);
-  const dataMax = Math.max(...voltages);
+  const dataMin = range.min;
+  const dataMax = range.max;
   const padding = Math.max((dataMax - dataMin) * 0.25, 0.005);
   const minVoltage = Math.floor((dataMin - padding) * 1000) / 1000;
   const maxVoltage = Math.ceil((dataMax + padding) * 1000) / 1000;
@@ -955,26 +1206,28 @@ function renderVoltageChart() {
     lastTimestamp,
   );
 
-  for (let tick = 0; tick <= 4; tick += 1) {
-    const value = minVoltage + (voltageRange * tick) / 4;
-    const lineY = y(value);
-    chart.append(
-      svgElement("line", {
-        class: "chart-grid-line",
-        x1: bounds.left,
-        x2: bounds.right,
-        y1: lineY,
-        y2: lineY,
-      }),
-    );
-    const label = svgElement("text", {
-      class: "chart-axis-label",
-      x: bounds.left - 10,
-      y: lineY + 3,
-      "text-anchor": "end",
-    });
-    label.textContent = value.toFixed(3);
-    chart.append(label);
+  if (chartMode !== "heatmap") {
+    for (let tick = 0; tick <= 4; tick += 1) {
+      const value = minVoltage + (voltageRange * tick) / 4;
+      const lineY = y(value);
+      chart.append(
+        svgElement("line", {
+          class: "chart-grid-line",
+          x1: bounds.left,
+          x2: bounds.right,
+          y1: lineY,
+          y2: lineY,
+        }),
+      );
+      const label = svgElement("text", {
+        class: "chart-axis-label",
+        x: bounds.left - 10,
+        y: lineY + 3,
+        "text-anchor": "end",
+      });
+      label.textContent = value.toFixed(3);
+      chart.append(label);
+    }
   }
 
   const formatTime = (timestamp) =>
@@ -1379,7 +1632,6 @@ function saveCurrentMeasurement() {
   if (!latestMeasurement || !settings || !measurementStorageKey) return;
   const timestamp = Date.parse(latestMeasurement.timestamp);
   if (timestamp - lastSavedAt < SAMPLE_INTERVAL_MS) return;
-  lastSavedAt = timestamp;
 
   const snapshot = {
     ...latestMeasurement,
@@ -1392,9 +1644,13 @@ function saveCurrentMeasurement() {
     localStorage.setItem(measurementStorageKey, JSON.stringify(nextMeasurements));
     measurements = nextMeasurements;
     lastSavedAt = timestamp;
+    measurementStorageWarningShown = false;
     renderLogSummary();
   } catch (error) {
-    showNotice(`Не вдалося зберегти журнал у браузері: ${error.message}`, "error");
+    if (!measurementStorageWarningShown) {
+      showNotice(`Не вдалося зберегти журнал у браузері: ${error.message}`, "error");
+      measurementStorageWarningShown = true;
+    }
   }
 }
 
@@ -1403,7 +1659,7 @@ function loadMeasurements(storageKey) {
     const stored = localStorage.getItem(storageKey);
     if (!stored && storageKey !== LOG_STORAGE_KEY && localStorage.getItem(LOG_STORAGE_KEY)) {
       if (!legacyLogNoticeShown) {
-        storageMessages.push(
+        storageWarnings.push(
           "Знайдено старий спільний журнал без ідентифікатора BMS; нові вимірювання зберігатимуться окремо.",
         );
         legacyLogNoticeShown = true;
@@ -1427,53 +1683,30 @@ function loadMeasurements(storageKey) {
     }
     return parsed.slice(-MAX_SAMPLES);
   } catch (error) {
-    storageMessages.push(`Не вдалося прочитати локальний журнал: ${error.message}`);
+    storageErrors.push(`Не вдалося прочитати локальний журнал: ${error.message}`);
     return [];
   }
 }
 
 function loadFlowSamples(storagePrefix) {
   try {
-    const chunkKeys = [];
+    const rawChunks = [];
     for (let index = 0; index < localStorage.length; index += 1) {
       const key = localStorage.key(index);
-      if (key?.startsWith(storagePrefix)) chunkKeys.push(key);
-    }
-
-    const samples = [];
-    for (const key of chunkKeys) {
-      const suffix = key.slice(storagePrefix.length);
-      const separator = suffix.lastIndexOf(".");
-      if (separator <= 0) throw new Error(`Некоректний ключ історії: ${key}`);
-      const sessionId = suffix.slice(0, separator);
-      const chunk = JSON.parse(localStorage.getItem(key) || "null");
-      if (!Array.isArray(chunk)) throw new Error(`Некоректний блок історії: ${key}`);
-      for (const entry of chunk) {
-        if (
-          !Array.isArray(entry) ||
-          ![2, 5, 6].includes(entry.length) ||
-          !Number.isFinite(entry[0]) ||
-          !Number.isFinite(entry[1]) ||
-          (entry.length >= 5 &&
-            !entry.slice(2, 5).every((value) => value === null || Number.isFinite(value))) ||
-          (entry.length === 6 && entry[5] !== "connection-end")
-        ) {
-          throw new Error(`Некоректний запис у блоці історії: ${key}`);
-        }
-        samples.push({
-          timestamp: entry[0],
-          current: entry[1],
-          voltage: entry.length >= 5 ? entry[2] : undefined,
-          power: entry.length >= 5 ? entry[3] : undefined,
-          stateOfCharge: entry.length >= 5 ? entry[4] : undefined,
-          sessionId,
-          kind: entry.length === 6 ? entry[5] : undefined,
-        });
+      if (key?.startsWith(storagePrefix)) {
+        rawChunks.push({ key, raw: localStorage.getItem(key) });
       }
     }
-    return samples.sort((first, second) => first.timestamp - second.timestamp);
+
+    const { samples, errors } = parseFlowChunkEntries(rawChunks, storagePrefix);
+    if (errors.length > 0) {
+      storageErrors.push(
+        `Частину історії струму цієї BMS не вдалося прочитати (${errors.length} блок.).`,
+      );
+    }
+    return samples;
   } catch (error) {
-    storageMessages.push(`Не вдалося прочитати історію струму цієї BMS: ${error.message}`);
+    storageErrors.push(`Не вдалося прочитати історію струму цієї BMS: ${error.message}`);
     return [];
   }
 }
@@ -1552,8 +1785,13 @@ function makeDeviceStorageKey(baseKey, deviceId) {
   return `${baseKey}.${encodeURIComponent(deviceId)}`;
 }
 
-function recordRecentDevice(connectedDevice) {
-  if (typeof connectedDevice.id !== "string" || connectedDevice.id.length === 0) return;
+function recordRecentDevice(connectedDevice, selectedDesktopDevice = null) {
+  const recentId =
+    typeof selectedDesktopDevice?.id === "string" && selectedDesktopDevice.id.length > 0
+      ? selectedDesktopDevice.id
+      : connectedDevice.id;
+  if (typeof recentId !== "string" || recentId.length === 0) return;
+  const recentName = selectedDesktopDevice?.name || connectedDevice.name || "JK BMS";
 
   try {
     const stored = JSON.parse(localStorage.getItem(BLUETOOTH_PREFERENCES_KEY) || "{}");
@@ -1564,8 +1802,8 @@ function recordRecentDevice(connectedDevice) {
       ? stored.recent.filter((entry) => entry && typeof entry.id === "string")
       : [];
     recent.unshift({
-      id: connectedDevice.id,
-      name: connectedDevice.name || "JK BMS",
+      id: recentId,
+      name: recentName,
       connectedAt: new Date().toISOString(),
     });
     const seenIds = new Set();
@@ -1601,10 +1839,10 @@ function setupDashboardLayout() {
     current: 1,
     power: 1,
     forecast: 2,
+    "charge-forecast": 2,
     flow: 2,
     cells: 3,
     status: 1,
-    settings: 1,
     logs: 4,
     alarms: 2,
   };
@@ -1614,10 +1852,10 @@ function setupDashboardLayout() {
     current: 120,
     power: 120,
     forecast: 140,
+    "charge-forecast": 140,
     flow: 240,
     cells: 240,
     status: 200,
-    settings: 140,
     logs: 100,
     alarms: 160,
   };
@@ -1820,13 +2058,28 @@ function setupDashboardLayout() {
   elements["layout-toggle"].addEventListener("click", () => {
     const editing = elements["layout-toggle"].getAttribute("aria-pressed") !== "true";
     elements["layout-toggle"].setAttribute("aria-pressed", String(editing));
-    elements["layout-toggle"].textContent = editing ? "Готово" : "Розташування";
+    elements["layout-toggle"].replaceChildren();
+    const icon = document.createElement("span");
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = editing ? "✓" : "▦";
+    elements["layout-toggle"].append(icon);
+    elements["layout-toggle"].dataset.tooltip = editing
+      ? "Завершити компонування"
+      : "Компонування блоків";
     elements["layout-toggle"].setAttribute(
       "aria-label",
       editing ? "Завершити компонування блоків" : "Увімкнути компонування блоків",
     );
     elements["layout-reset"].hidden = !editing;
-    elements["layout-hint"].hidden = !editing;
+    if (editing) {
+      showNotice(
+        "Перетягни блок за ⠿, зміни розмір за кутовий маркер або скористайся стрілками клавіатури.",
+        "info",
+        { key: "layout-hint", duration: 6000 },
+      );
+    } else {
+      dismissNotice("layout-hint");
+    }
     dashboard.classList.toggle("layout-editing", editing);
     for (const handle of dashboard.querySelectorAll(".widget-handle, .widget-resize-handle")) {
       handle.hidden = !editing;
@@ -1846,7 +2099,6 @@ function setupDashboardLayout() {
         columns: defaultColumns[widget.dataset.widget] ?? 1,
         minHeight: undefined,
       });
-      widget.style.removeProperty("min-height");
       applyWidgetSize(widget);
     }
     animateDashboardLayout(firstRects);
@@ -1923,6 +2175,9 @@ function setupDashboardLayout() {
     const gridStyle = getComputedStyle(dashboard);
     const rowHeight = Number.parseFloat(gridStyle.gridAutoRows);
     const rowGap = Number.parseFloat(gridStyle.rowGap);
+    if (!Number.isFinite(rowHeight) || !Number.isFinite(rowGap) || rowHeight + rowGap <= 0) {
+      return;
+    }
     const widgetHeight = Math.max(widget.scrollHeight, widget.getBoundingClientRect().height);
     const rowSpan = Math.max(1, Math.ceil((widgetHeight + rowGap) / (rowHeight + rowGap)));
     widget.style.gridRowEnd = `span ${rowSpan}`;
@@ -1964,15 +2219,13 @@ function setupDashboardLayout() {
         for (const widget of movingWidgets) {
           widget.classList.add("is-flipping");
           widget.style.transform = "translate(0, 0)";
-          widget.addEventListener(
-            "transitionend",
-            (event) => {
-              if (event.propertyName !== "transform") return;
-              widget.classList.remove("is-flipping");
-              widget.style.removeProperty("transform");
-            },
-            { once: true },
-          );
+          const onTransitionEnd = (event) => {
+            if (event.target !== widget || event.propertyName !== "transform") return;
+            widget.removeEventListener("transitionend", onTransitionEnd);
+            widget.classList.remove("is-flipping");
+            widget.style.removeProperty("transform");
+          };
+          widget.addEventListener("transitionend", onTransitionEnd);
         }
       });
     });
@@ -2047,7 +2300,7 @@ function exportCsv() {
   link.href = url;
   link.download = `jk-bms-${new Date().toISOString().slice(0, 10)}.csv`;
   link.click();
-  URL.revokeObjectURL(url);
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function clearLogs() {
@@ -2065,9 +2318,7 @@ function clearLogs() {
 }
 
 function csvCell(value) {
-  const text = String(value ?? "");
-  const safeText = /^[\t\r ]*[=+\-@]/.test(text) ? `'${text}` : text;
-  return `"${safeText.replaceAll('"', '""')}"`;
+  return formatCsvCell(value);
 }
 
 function handleDisconnect() {
@@ -2075,13 +2326,21 @@ function handleDisconnect() {
   persistFlowChunk();
   if (sampleTimer) window.clearInterval(sampleTimer);
   sampleTimer = undefined;
+  if (notifyCharacteristic) {
+    notifyCharacteristic.removeEventListener("characteristicvaluechanged", handleNotification);
+    notifyCharacteristic = undefined;
+  }
   writeCharacteristic = undefined;
+  dismissNotice("protocol-detect");
   setConnectionState("Не підключено", false);
   elements["connect-button"].disabled = false;
+  elements["connect-button"].hidden = false;
   elements["disconnect-button"].disabled = true;
+  elements["disconnect-button"].hidden = true;
   elements["refresh-button"].disabled = true;
-  elements["settings-button"].disabled = true;
+  elements["refresh-button"].hidden = true;
   renderDischargeForecast({ status: "disconnected" });
+  renderChargeForecast({ status: "disconnected" });
   showNotice("З’єднання з BMS завершено.");
 }
 
@@ -2098,18 +2357,89 @@ function setConnectionState(label, connected) {
   elements["connection-indicator"].classList.toggle("is-connected", connected);
 }
 
-function showNotice(message, kind = "info") {
-  window.clearTimeout(noticeTimer);
-  elements.notice.textContent = message;
-  elements.notice.dataset.kind = kind;
-  elements.notice.hidden = false;
-  if (kind === "info") {
-    noticeTimer = window.setTimeout(clearNotice, 6000);
-  }
+function dismissNotice(key) {
+  const entry = activeToasts.get(key);
+  if (!entry) return;
+  activeToasts.delete(key);
+  if (entry.timer) window.clearTimeout(entry.timer);
+  entry.element.classList.add("is-leaving");
+  window.setTimeout(() => entry.element.remove(), 180);
 }
 
-function clearNotice() {
-  elements.notice.hidden = true;
+function showNotice(message, kind = "info", options = {}) {
+  const container = elements["toast-container"];
+  if (!container) return;
+
+  const {
+    key,
+    duration = kind === "error" ? 8000 : 5000,
+    persistent = false,
+    action,
+    dismissible = persistent,
+    onDismiss,
+  } = options;
+
+  let entry = key ? activeToasts.get(key) : undefined;
+  let toast;
+  if (entry) {
+    if (entry.timer) window.clearTimeout(entry.timer);
+    entry.timer = undefined;
+    toast = entry.element;
+    toast.classList.remove("is-leaving");
+    toast.replaceChildren();
+  } else {
+    toast = document.createElement("div");
+    toast.className = "notice";
+    container.append(toast);
+    entry = { element: toast, timer: undefined };
+    if (key) activeToasts.set(key, entry);
+  }
+
+  toast.dataset.kind = kind;
+  toast.setAttribute("role", kind === "error" ? "alert" : "status");
+
+  const text = document.createElement("span");
+  text.className = "notice-message";
+  text.textContent = message;
+  toast.append(text);
+
+  const removeToast = (notifyDismiss = false) => {
+    if (key && activeToasts.get(key) === entry) {
+      activeToasts.delete(key);
+    }
+    if (entry.timer) window.clearTimeout(entry.timer);
+    entry.timer = undefined;
+    toast.classList.add("is-leaving");
+    window.setTimeout(() => toast.remove(), 180);
+    if (notifyDismiss) onDismiss?.();
+  };
+
+  if (action || dismissible) {
+    const actions = document.createElement("div");
+    actions.className = "notice-actions";
+    if (action) {
+      const button = document.createElement("button");
+      button.className = "notice-action";
+      button.type = "button";
+      button.textContent = action.label;
+      button.addEventListener("click", () => action.onClick());
+      actions.append(button);
+    }
+    if (dismissible) {
+      const closeButton = document.createElement("button");
+      closeButton.className = "notice-dismiss";
+      closeButton.type = "button";
+      closeButton.setAttribute("aria-label", "Закрити повідомлення");
+      closeButton.textContent = "×";
+      closeButton.addEventListener("click", () => removeToast(true));
+      actions.append(closeButton);
+    }
+    toast.append(actions);
+  }
+
+  if (!persistent && duration > 0) {
+    entry.timer = window.setTimeout(() => removeToast(false), duration);
+  }
 }
 
 function format(value, digits) {

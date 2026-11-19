@@ -15,6 +15,19 @@ const MIME_TYPES = new Map([
   [".js", "text/javascript; charset=utf-8"],
   [".mjs", "text/javascript; charset=utf-8"],
 ]);
+const ALLOWED_APP_FILES = new Set([
+  "index.html",
+  "styles.css",
+  "app.mjs",
+  "app-utils.mjs",
+  "protocol.mjs",
+  "discharge-forecast.mjs",
+  "flow-periods.mjs",
+  "voltage-chart-data.mjs",
+  "electron/bluetooth-picker.html",
+  "electron/bluetooth-picker.css",
+  "electron/bluetooth-picker.js",
+]);
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -32,8 +45,11 @@ let mainWindow;
 let pickerWindow;
 let bluetoothSelectionCallback;
 let bluetoothDevices = [];
+let lastSelectedBluetoothDevice;
 let pickerReady = false;
 let updateStatus = { state: "idle" };
+let startupUpdateTimer;
+let startupUpdateChecked = false;
 
 app.whenReady()
   .then(() => {
@@ -78,11 +94,13 @@ async function serveAppFile(request) {
   const appPath = app.getAppPath();
   const filePath = path.resolve(appPath, relativePath);
   const pathFromApp = path.relative(appPath, filePath);
+  const normalizedRelativePath = pathFromApp.split(path.sep).join("/");
   if (
     !pathFromApp ||
     pathFromApp === ".." ||
     pathFromApp.startsWith(`..${path.sep}`) ||
-    path.isAbsolute(pathFromApp)
+    path.isAbsolute(pathFromApp) ||
+    !ALLOWED_APP_FILES.has(normalizedRelativePath)
   ) {
     return new Response("Заборонено.", { status: 403 });
   }
@@ -212,19 +230,34 @@ function publishUpdateStatus(status) {
 }
 
 function configureBluetoothPicker() {
+  ipcMain.handle("bluetooth-picker:consume-selected", (event) => {
+    assertMainWindowSender(event);
+    const selected = lastSelectedBluetoothDevice;
+    lastSelectedBluetoothDevice = undefined;
+    return selected ?? null;
+  });
+
   ipcMain.on("bluetooth-picker:choose", (event, deviceId) => {
+    const chosenDevice = bluetoothDevices.find((device) => device.deviceId === deviceId);
     if (
       event.sender !== pickerWindow?.webContents ||
       typeof deviceId !== "string" ||
-      !bluetoothDevices.some((device) => device.deviceId === deviceId)
+      !chosenDevice
     ) {
       return;
     }
+    lastSelectedBluetoothDevice = {
+      id: chosenDevice.deviceId,
+      name: chosenDevice.deviceName || "",
+    };
     finishBluetoothSelection(deviceId);
   });
 
   ipcMain.on("bluetooth-picker:cancel", (event) => {
-    if (event.sender === pickerWindow?.webContents) finishBluetoothSelection("");
+    if (event.sender === pickerWindow?.webContents) {
+      lastSelectedBluetoothDevice = undefined;
+      finishBluetoothSelection("");
+    }
   });
 }
 
@@ -257,11 +290,20 @@ function createMainWindow() {
   });
   mainWindow.webContents.on("did-finish-load", () => {
     publishUpdateStatus(updateStatus);
-    if (app.isPackaged) setTimeout(() => void checkForUpdates(), 5000);
+    if (app.isPackaged && !startupUpdateChecked && updateStatus.state === "idle") {
+      startupUpdateChecked = true;
+      clearTimeout(startupUpdateTimer);
+      startupUpdateTimer = setTimeout(() => {
+        startupUpdateTimer = undefined;
+        if (updateStatus.state === "idle") void checkForUpdates();
+      }, 5000);
+    }
   });
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   mainWindow.on("ready-to-show", () => mainWindow.show());
   mainWindow.on("closed", () => {
+    clearTimeout(startupUpdateTimer);
+    startupUpdateTimer = undefined;
     if (bluetoothSelectionCallback) finishBluetoothSelection("");
     mainWindow = undefined;
   });
@@ -275,7 +317,6 @@ function createMainWindow() {
 
 function showBluetoothPicker() {
   if (pickerWindow && !pickerWindow.isDestroyed()) {
-    pickerWindow.focus();
     return;
   }
 
@@ -299,6 +340,10 @@ function showBluetoothPicker() {
     },
   });
 
+  pickerWindow.webContents.on("will-navigate", (event, url) => {
+    if (!isAppOrigin(url)) event.preventDefault();
+  });
+  pickerWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   pickerWindow.webContents.on("did-finish-load", () => {
     pickerReady = true;
     publishBluetoothDevices();

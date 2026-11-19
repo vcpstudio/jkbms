@@ -99,3 +99,59 @@ test("marks a period that begins mid-flow as having an unobserved start boundary
 
   assert.equal(period.startBoundaryKnown, false);
 });
+
+test("does not let subsequent idle samples corrupt endSoc or averageVoltage of a finished period", () => {
+  const periods = buildFlowPeriods(
+    [
+      sample(0, 0, { stateOfCharge: 50, voltage: 52 }),
+      sample(1_000, 10, { stateOfCharge: 50, voltage: 54 }),
+      sample(11_000, 0, { power: 0, stateOfCharge: 55, voltage: 53 }),
+      sample(60_000, 0, { power: 0, stateOfCharge: 51, voltage: 50 }),
+      sample(120_000, 0, { power: 0, stateOfCharge: 48, voltage: 49 }),
+    ],
+    11_000 + FLOW_IDLE_GAP_MS + 1,
+  );
+
+  assert.equal(periods.length, 1);
+  assert.equal(periods[0].endTimestamp, 11_000);
+  assert.equal(periods[0].endSoc, 55);
+  assert.equal(periods[0].socChange, 5);
+  assert.equal(periods[0].averageVoltage, 54);
+});
+
+test("marks unclosed prior sessions as interrupted when disconnected (activeSessionId is null)", () => {
+  const [period] = buildFlowPeriods(
+    [sample(0, 0), sample(1_000, -5), sample(6_000, -5)],
+    10_000,
+    FLOW_IDLE_GAP_MS,
+    { activeSessionId: null },
+  );
+
+  assert.equal(period.status, "interrupted");
+});
+
+test("treats only the session matching activeSessionId as active", () => {
+  const periods = buildFlowPeriods(
+    [
+      sample(0, 0, { sessionId: "old-session" }),
+      sample(1_000, -5, { sessionId: "old-session" }),
+      sample(10_000, 4, { sessionId: "live-session" }),
+    ],
+    15_000,
+    FLOW_IDLE_GAP_MS,
+    { activeSessionId: "live-session" },
+  );
+
+  assert.equal(periods[0].status, "interrupted");
+  assert.equal(periods[1].status, "active");
+});
+
+test("does not treat a zero-current connection-end marker as a known start boundary", () => {
+  const periods = buildFlowPeriods([
+    sample(1_000, 0, { kind: "connection-end" }),
+    sample(2_000, -3),
+  ]);
+
+  assert.equal(periods.length, 1);
+  assert.equal(periods[0].startBoundaryKnown, false);
+});

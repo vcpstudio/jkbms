@@ -170,6 +170,7 @@ export function decodeLiveData(frame, cellCount, protocolVersion = "JK02_24S") {
   const balanceCurrentOffset = is32CellLayout ? 170 : 62;
   const socOffset = is32CellLayout ? 173 : 141;
   const remainingCapacityOffset = is32CellLayout ? 174 : 142;
+  const nominalCapacityOffset = is32CellLayout ? 178 : 146;
   const cycleCountOffset = is32CellLayout ? 182 : 150;
   const protectionOffset = is32CellLayout ? 166 : 136;
   const cellVoltages = [];
@@ -180,7 +181,8 @@ export function decodeLiveData(frame, cellCount, protocolVersion = "JK02_24S") {
     cellResistances.push(view.getUint16(cellResistanceOffset + index * 2, true) / 1000);
   }
 
-  const sumVoltage = cellVoltages.reduce((sum, value) => sum + value, 0);
+  const validCellVoltages = cellVoltages.filter((value) => value > 0);
+  const sumVoltage = validCellVoltages.reduce((sum, value) => sum + value, 0);
   const voltage = view.getUint32(packVoltageOffset, true) / 1000;
   const current = view.getInt32(currentOffset, true) / 1000;
   const protectionMask = is32CellLayout
@@ -200,9 +202,13 @@ export function decodeLiveData(frame, cellCount, protocolVersion = "JK02_24S") {
     power: voltage * current,
     stateOfCharge: view.getUint8(socOffset),
     remainingCapacity: view.getUint32(remainingCapacityOffset, true) / 1000,
+    nominalCapacity: view.getUint32(nominalCapacityOffset, true) / 1000,
     cycleCount: view.getUint32(cycleCountOffset, true),
-    averageCellVoltage: sumVoltage / cellVoltages.length,
-    cellVoltageDelta: Math.max(...cellVoltages) - Math.min(...cellVoltages),
+    averageCellVoltage: validCellVoltages.length > 0 ? sumVoltage / validCellVoltages.length : 0,
+    cellVoltageDelta:
+      validCellVoltages.length > 0
+        ? Math.max(...validCellVoltages) - Math.min(...validCellVoltages)
+        : 0,
     balanceCurrent: view.getInt16(balanceCurrentOffset, true) / 1000,
     temperature1: view.getInt16(temperature1Offset, true) / 10,
     temperature2: view.getInt16(temperature2Offset, true) / 10,

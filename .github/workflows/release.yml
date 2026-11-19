@@ -51,6 +51,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
@@ -59,13 +62,19 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" release-assets/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "JK BMS Monitor $GITHUB_REF_NAME" \
-            --notes "Випуск JK BMS Monitor.
+          git tag -l --format='%(contents)' "$GITHUB_REF_NAME" > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            cat <<'EOF' > release-notes.md
+          Випуск JK BMS Monitor.
 
           - Моніторинг JK BMS через Bluetooth LE.
           - Окремі історії вимірювань і періодів заряду/розряду для кожного пристрою.
-          - Графіки напруги комірок, опір комірок, тривоги та прогноз розряду.
+          - Графіки напруги комірок, опір комірок, тривоги та прогнози заряду/розряду.
           - Перетягуване адаптивне компонування панелей.
-          - Інсталятори для Windows, macOS і Linux."
+          - Інсталятори для Windows, macOS і Linux.
+          EOF
+          fi
+          gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "JK BMS Monitor $GITHUB_REF_NAME" \
+            --notes-file release-notes.md

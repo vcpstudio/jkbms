@@ -15,43 +15,42 @@
   <body>
     <main class="shell">
       <header class="topbar">
-        <a class="brand" href="./" aria-label="JK BMS Monitor, головна">
+        <div class="brand">
           <span class="brand-mark" aria-hidden="true">JK</span>
           <span>BATTERY MONITOR</span>
-        </a>
+        </div>
         <div class="topbar-right">
           <span id="connection-indicator" class="connection-indicator">
             <span class="status-dot"></span>
             <span id="connection-state">Не підключено</span>
           </span>
-          <button id="app-update-button" class="button button-outline" type="button" hidden>
-            Перевірити оновлення
+          <button id="connect-button" class="icon-button icon-button-primary" type="button" aria-label="Підключити BMS" data-tooltip="Підключити BMS">
+            <span aria-hidden="true">⌁</span>
           </button>
-          <button id="connect-button" class="button button-primary" type="button">
-            Підключити BMS
+          <button id="disconnect-button" class="icon-button" type="button" aria-label="Від’єднати BMS" data-tooltip="Від’єднати BMS" disabled hidden>
+            <span aria-hidden="true">⏻</span>
           </button>
-          <button id="disconnect-button" class="button button-quiet" type="button" disabled>
-            Від’єднати
+          <button id="refresh-button" class="icon-button" type="button" aria-label="Оновити дані" data-tooltip="Оновити дані" disabled hidden>
+            <span aria-hidden="true">↻</span>
+          </button>
+          <button id="app-update-button" class="icon-button" type="button" aria-label="Перевірити оновлення" data-tooltip="Перевірити оновлення" hidden>
+            <span aria-hidden="true">⇧</span>
           </button>
           <button
             id="layout-toggle"
-            class="button button-outline"
+            class="icon-button"
             type="button"
             aria-pressed="false"
             aria-label="Увімкнути компонування блоків"
+            data-tooltip="Компонування блоків"
           >
-            Розташування
+            <span aria-hidden="true">▦</span>
           </button>
-          <button id="layout-reset" class="button button-quiet" type="button" hidden>
-            Скинути
+          <button id="layout-reset" class="icon-button" type="button" aria-label="Скинути компонування" data-tooltip="Скинути компонування" hidden>
+            <span aria-hidden="true">↺</span>
           </button>
         </div>
       </header>
-
-      <div id="app-update-banner" class="app-update-banner" role="status" aria-live="polite" hidden>
-        <span id="app-update-message"></span>
-        <button id="app-update-action" class="button button-outline" type="button" hidden></button>
-      </div>
 
       <section class="intro">
         <div>
@@ -61,16 +60,9 @@
             Підключи JK BMS, щоб переглядати дані в реальному часі.
           </p>
         </div>
-        <button id="refresh-button" class="button button-outline" type="button" disabled>
-          Оновити дані
-          <span aria-hidden="true">↻</span>
-        </button>
       </section>
 
-      <div id="notice" class="notice" role="status" hidden></div>
-      <p id="layout-hint" class="layout-hint" role="status" hidden>
-        Перетягни блок за ⠿, зміни розмір за кутовий маркер або скористайся стрілками клавіатури.
-      </p>
+      <div id="toast-container" class="toast-container" aria-live="polite" aria-atomic="false"></div>
 
       <section id="dashboard-grid" class="dashboard-grid" aria-label="Блоки моніторингу батареї">
         <article class="metric-card metric-primary dashboard-widget widget-metric" data-widget="soc">
@@ -113,6 +105,14 @@
           </div>
           <div id="discharge-runtime-value" class="metric-value metric-runtime-value">—</div>
           <div id="discharge-runtime-detail" class="metric-foot">Оцінка з’явиться під час розряду</div>
+        </article>
+        <article class="metric-card metric-runtime dashboard-widget widget-metric" data-widget="charge-forecast">
+          <div class="metric-heading">
+            <span>ПРОГНОЗ ЗАРЯДУ</span>
+            <span class="metric-symbol" aria-hidden="true">⌁</span>
+          </div>
+          <div id="charge-runtime-value" class="metric-value metric-runtime-value">—</div>
+          <div id="charge-runtime-detail" class="metric-foot">Оцінка з’явиться під час заряджання</div>
         </article>
         <article class="panel dashboard-widget widget-flow" data-widget="flow">
           <div class="panel-heading panel-heading-compact">
@@ -273,22 +273,6 @@
             Очікування телеметрії BMS
           </p>
           <ul id="protection-list" class="protection-list" aria-label="Активні тривоги" hidden></ul>
-        </article>
-
-        <article class="panel settings-panel dashboard-widget widget-settings" data-widget="settings">
-          <div class="panel-heading panel-heading-compact">
-            <div>
-              <p class="eyebrow">КОНФІГУРАЦІЯ</p>
-              <h2>Налаштування</h2>
-            </div>
-            <span class="read-only-tag">ТІЛЬКИ ЧИТАННЯ</span>
-          </div>
-          <p class="settings-copy">
-            Зчитуються базові прапорці з BMS. Запис вимкнено, доки не підтверджено модель і сумісність протоколу.
-          </p>
-          <button id="settings-button" class="button button-outline button-wide" type="button" disabled>
-            Налаштування доступні після з’єднання
-          </button>
         </article>
 
         <section class="panel logs-panel dashboard-widget widget-logs" data-widget="logs">

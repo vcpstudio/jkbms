@@ -18,4 +18,7 @@ contextBridge.exposeInMainWorld("jkbmsDesktop", {
   openReleasePage() {
     return ipcRenderer.invoke("app-update:open-release");
   },
+  consumeSelectedBluetoothDevice() {
+    return ipcRenderer.invoke("bluetooth-picker:consume-selected");
+  },
 });
